@@ -30,12 +30,29 @@ RF_STOP = 13 # Кнопка "Stop"
 R_BUTTONS = 17 # Реле IN1-IN6
 R_PLAYPAUSE = 27 # Реле IN7
 R_STOP = 22 # Реле IN8
-# Подключаемся к чипу GPIO
-h = lgpio.gpiochip_open(4)  # Открываем gpiochip0.  Проверьте, что имя чипа верное (ls /dev/gpiochip*)
-# Привязка кнопок к PIN
-b_increase = Button(h, RF_INCREASE)
-b_playpause = Button(h, RF_PLAYPAUSE)
-b_stop = Button(h, RF_STOP)
+
+# Группы пинов (для гибкой инициализации/логирования)
+OUTPUT_PINS = {
+    'RF_INCREASE': RF_INCREASE,
+    'RF_PLAYPAUSE': RF_PLAYPAUSE,
+    'RF_STOP': RF_STOP,
+}
+INPUT_PINS = {
+    'R_BUTTONS': R_BUTTONS,
+    'R_PLAYPAUSE': R_PLAYPAUSE,
+    'R_STOP': R_STOP,
+}
+PIN_TO_OUTPUT_NAME = {pin: name for name, pin in OUTPUT_PINS.items()}
+
+# Глобальные переменные - инициализируются в setup()
+h = None
+b_increase = None
+b_playpause = None
+b_stop = None
+
+# Флаги для отслеживания каких контактов удалось выделить
+gpio_pins_available = {name: False for name in {**OUTPUT_PINS, **INPUT_PINS}}
+
 # Режим активации реле
 isRelayLow = True # Флаг: тип активации реле = low level
 isRelayHigh = not isRelayLow # Флаг: тип активации реле = high level
@@ -44,21 +61,64 @@ state_starting = True
 state_playing = False
 state_waiting = False
 
+# Однократное предупреждение о неподключенном реле
+relay_disconnected_warned = False
 
-# Конфигурация Raspberry
+
 def setup():
-    # Настраиваем PIN на выходной сигнал
-    lgpio.gpio_claim_output(h, RF_INCREASE)
-    lgpio.gpio_claim_output(h, RF_PLAYPAUSE)
-    lgpio.gpio_claim_output(h, RF_STOP)
-    # Настраиваем PIN на входной сигнал
-    lgpio.gpio_claim_input(h, R_BUTTONS)
-    lgpio.gpio_claim_input(h, R_PLAYPAUSE)
-    lgpio.gpio_claim_input(h, R_STOP)
+    global h, b_increase, b_playpause, b_stop, gpio_pins_available
+    try:
+        gpiochip = None
+        for i in range(10):
+            try:
+                test_h = lgpio.gpiochip_open(i)
+                lgpio.gpiochip_close(test_h)
+                gpiochip = i
+                break
+            except Exception:
+                continue
+
+        if gpiochip is None:
+            raise Exception("No available gpiochip found (tried gpiochip0-9)")
+
+        print(f"Using gpiochip{gpiochip}")
+        h = lgpio.gpiochip_open(gpiochip)
+
+        b_increase = Button(h, RF_INCREASE)
+        b_playpause = Button(h, RF_PLAYPAUSE)
+        b_stop = Button(h, RF_STOP)
+
+        for pin_name, pin in OUTPUT_PINS.items():
+            try:
+                lgpio.gpio_claim_output(h, pin)
+                gpio_pins_available[pin_name] = True
+                print(f"GPIO {pin_name}({pin}) -> OK (output)")
+            except Exception as e:
+                gpio_pins_available[pin_name] = False
+                print(f"GPIO {pin_name}({pin}) -> BUSY ({e})")
+
+        for pin_name, pin in INPUT_PINS.items():
+            try:
+                lgpio.gpio_claim_input(h, pin)
+                gpio_pins_available[pin_name] = True
+                print(f"GPIO {pin_name}({pin}) -> OK (input)")
+            except Exception as e:
+                gpio_pins_available[pin_name] = False
+                print(f"GPIO {pin_name}({pin}) -> BUSY ({e})")
+
+        print(f"GPIO summary: {sum(gpio_pins_available.values())}/{len(gpio_pins_available)} pins available")
+    except Exception as e:
+        print(f"ERROR: GPIO initialization failed: {e}")
+        h = None
+        for key in gpio_pins_available:
+            gpio_pins_available[key] = False
 
 
 # Главная цикличная функция Raspberry
 def loop(queue_main = None):
+    # Инициализируем GPIO при запуске процесса
+    setup()
+    
     while True:
         updateState()
     # if b_increase.isClicked():
@@ -68,8 +128,9 @@ def loop(queue_main = None):
     # elif b_stop.isClicked():
     #     action(RF_STOP)
         try:
-            signal = queue_main.get(timeout=0.1)
-            action(signal)
+            if queue_main is not None:
+                signal = queue_main.get(timeout=0.1)
+                action(signal)
         except queue.Empty:
             pass
         time.sleep(0.1)
@@ -127,9 +188,20 @@ def action(signal):
 
 # Имитация нажатия кнопки Радиореле
 def rf_click(rf_pin: int):
-    lgpio.gpio_write(h, rf_pin, 1)
-    time.sleep(1)
-    lgpio.gpio_write(h, rf_pin, 0)
+    # Определяем какой флаг проверить
+    pin_name = PIN_TO_OUTPUT_NAME.get(rf_pin)
+    
+    # Если GPIO не инициализирована или контакт недоступен, пропускаем
+    if h is None or (pin_name and not gpio_pins_available.get(pin_name, False)):
+        print(f"WARNING: Cannot click RF pin {rf_pin} - GPIO not available")
+        return
+    
+    try:
+        lgpio.gpio_write(h, rf_pin, 1)
+        time.sleep(1)
+        lgpio.gpio_write(h, rf_pin, 0)
+    except Exception as e:
+        print(f"WARNING: Error writing to GPIO pin {rf_pin}: {e}")
 
 
 # # Активация реле
@@ -161,19 +233,29 @@ def updateState():
     global state_playing
     global state_waiting
     global isRelayLow
-    buttons_state = lgpio.gpio_read(h, R_BUTTONS)
-    playpause_state = lgpio.gpio_read(h, R_PLAYPAUSE)
-    stop_state = lgpio.gpio_read(h, R_STOP)
+    global relay_disconnected_warned
+    
+    # Если GPIO не инициализирована или контакты недоступны, пропускаем
+    if h is None or not gpio_pins_available['R_BUTTONS'] or not gpio_pins_available['R_PLAYPAUSE'] or not gpio_pins_available['R_STOP']:
+        return
+    
+    try:
+        buttons_state = lgpio.gpio_read(h, R_BUTTONS)
+        playpause_state = lgpio.gpio_read(h, R_PLAYPAUSE)
+        stop_state = lgpio.gpio_read(h, R_STOP)
+    except Exception as e:
+        print(f"WARNING: Error reading GPIO: {e}")
+        return
     if isRelayLow:
         buttons_state = not buttons_state
         playpause_state = not playpause_state
         stop_state = not stop_state
     # Нажаты все кнопки? : Реле не подключено
     if buttons_state and playpause_state and stop_state:
-        print("STATE: ERROR")
-        state_starting = False
-        state_playing = False
-        state_waiting = False
+        if not relay_disconnected_warned:
+            print("WARNING: Relay disconnected")
+            relay_disconnected_warned = True
+        return
     # Нажат STOP? : сброс
     elif not state_starting and stop_state:
         print("STATE: STARTING")
@@ -201,6 +283,16 @@ if __name__ == "__main__":
         setup()
         loop()
     except KeyboardInterrupt:
-        pass
+        print("Timer received KeyboardInterrupt")
+    except Exception as e:
+        print(f"Timer error: {e}")
     finally:
-        lgpio.gpiochip_close(h)
+        # Правильное закрытие GPIO
+        if h is not None:
+            try:
+                print("Closing GPIO chip...")
+                lgpio.gpiochip_close(h)
+                print("GPIO chip closed successfully")
+            except Exception as e:
+                print(f"Error closing GPIO chip: {e}")
+        print("Timer shutdown complete")
