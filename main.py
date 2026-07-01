@@ -85,6 +85,7 @@ if __name__ == "__main__":
 
 import server
 import timer
+import project_cleanup
 
 # Пути приложения
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -139,74 +140,6 @@ def signal_handler(signum, frame):
     sys.exit(0)
 
 
-def _kill_pids(pids, reason):
-    if not pids:
-        return
-    unique_pids = sorted({int(pid) for pid in pids if str(pid).isdigit()})
-    if not unique_pids:
-        return
-
-    for pid in unique_pids:
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-        except Exception as exc:
-            logging.warning("Failed to SIGTERM pid=%s: %s", pid, exc)
-
-    time.sleep(1)
-
-    for pid in unique_pids:
-        try:
-            os.kill(pid, 0)
-            os.kill(pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        except Exception as exc:
-            logging.warning("Failed to SIGKILL pid=%s: %s", pid, exc)
-
-
-def cleanup_stale_project_processes():
-    current_pid = os.getpid()
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    script_markers = []
-    try:
-        for name in os.listdir(script_dir):
-            if name.lower().endswith(".py"):
-                script_markers.append(os.path.join(script_dir, name))
-    except Exception as exc:
-        logging.warning("Failed to list python scripts in %s: %s", script_dir, exc)
-        return
-
-    if not script_markers:
-        return
-
-    try:
-        result = subprocess.run(
-            ["ps", "-eo", "pid,args"],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        stale_pids = []
-        for line in result.stdout.splitlines()[1:]:
-            parts = line.strip().split(None, 1)
-            if len(parts) < 2:
-                continue
-            pid_text, args_text = parts
-            if not pid_text.isdigit():
-                continue
-            pid = int(pid_text)
-            if pid == current_pid:
-                continue
-            if any(marker in args_text for marker in script_markers):
-                stale_pids.append(pid)
-
-        _kill_pids(stale_pids, "project scripts")
-    except Exception as exc:
-        logging.warning("Failed to cleanup stale project processes: %s", exc)
-
-
 def main():
     # Регистрируем обработчики сигналов
     signal.signal(signal.SIGTERM, signal_handler)
@@ -214,7 +147,12 @@ def main():
     
     logging.info("MAIN service STARTED")
 
-    cleanup_stale_project_processes()
+    project_cleanup.cleanup_stale_project_processes(log=logging.info)
+
+    try:
+        multiprocessing.set_start_method("spawn")
+    except RuntimeError:
+        pass
 
     queue_main = multiprocessing.Queue()
     server_process = None

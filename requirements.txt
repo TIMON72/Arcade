@@ -1,0 +1,3 @@
+lgpio>=0.2.2.0
+aiohttp>=3.9.0
+luma.led_matrix>=2.5.1

@@ -1,2 +1,5 @@
 venv
+.venv
 logs.log
+/__pycache__
+.lgd-nfy0

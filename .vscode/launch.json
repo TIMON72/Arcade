@@ -9,13 +9,17 @@
             "type": "debugpy",
             "request": "launch",
             "program": "${workspaceFolder}/main.py",
+            "python": "${workspaceFolder}/venv/bin/python",
             "console": "integratedTerminal",
+            "subProcess": true,
+            "justMyCode": true
         },
         {
             "name": "Server",
             "type": "debugpy",
             "request": "launch",
             "program": "${workspaceFolder}/server.py",
+            "python": "${workspaceFolder}/venv/bin/python",
             "console": "integratedTerminal",
         },
         {
@@ -23,6 +27,7 @@
             "type": "debugpy",
             "request": "launch",
             "program": "${workspaceFolder}/timer.py",
+            "python": "${workspaceFolder}/venv/bin/python",
             "console": "integratedTerminal"
         },
     ],
