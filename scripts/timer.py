@@ -4,8 +4,6 @@ import sys
 import time
 from datetime import datetime
 
-import project_cleanup
-
 
 # Класс кнопки
 class Button:
@@ -398,7 +396,8 @@ def setup():
     global h, b_increase, b_playpause, b_stop, gpio_pins_available
     if h is not None and any(gpio_pins_available.values()):
         return
-    project_cleanup.cleanup_stale_project_processes(log=print)
+    import main as app_main
+    app_main.cleanup_stale_project_processes(log=print)
     print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - Timer started")
     try:
         gpiochip = None

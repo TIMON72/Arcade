@@ -7,9 +7,9 @@ from aiohttp import web
 
 
 
-path = os.path.dirname(os.path.abspath(__file__))
-path_project = os.path.dirname(path)
-sys.path.append(path_project)
+SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(SCRIPTS_DIR)
+sys.path.insert(0, SCRIPTS_DIR)
 routes = web.RouteTableDef()
 
 
@@ -47,7 +47,7 @@ async def server_setup(queue_main):
     app.add_routes(routes)
     app.add_routes(
         [
-            web.static("/", path),
+            web.static("/", SCRIPTS_DIR),
         ]
     )
     return app
