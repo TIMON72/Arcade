@@ -1,3 +1,1 @@
-# Зафиксированные версии; wheel-файлы в scripts/wheels/ (aarch64, Python 3.12).
-# Обновление: python scripts/main.py vendor-wheels
 luma.led_matrix==1.9.0

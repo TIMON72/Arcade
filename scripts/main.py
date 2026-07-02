@@ -21,12 +21,23 @@ _DEPLOY_MARKER = os.path.join(_BATOCERA_SYSTEM_DIR, ".arcade-deployed")
 
 
 _CONFIG_FILENAME = "config_timer.toml"
+_LUMA_PACKAGE = "luma.led_matrix==1.9.0"
+_REQUIREMENTS_FILE_NAME = "requirements.txt"
 
 
 def _find_project_root() -> str:
     if os.path.isfile(os.path.join(_SCRIPT_DIR, _CONFIG_FILENAME)):
         return _SCRIPT_DIR
     return os.path.dirname(_SCRIPT_DIR)
+
+
+def _resolve_wheels_dir() -> str:
+    """wheels/ в корне репозитория; после deploy — в /userdata/system/scripts/wheels/."""
+    for base in (_SCRIPT_DIR, _find_project_root()):
+        path = os.path.join(base, "wheels")
+        if os.path.isdir(path):
+            return path
+    return os.path.join(_find_project_root(), "wheels")
 
 
 def _resolve_venv_dir() -> str:
@@ -39,17 +50,30 @@ def _resolve_venv_dir() -> str:
     return script_venv
 
 
+def _bundle_root() -> str:
+    """Корень репозитория: configs/, services/, scripts/, wheels/."""
+    source = _deploy_source_root()
+    if source:
+        return source
+    if os.path.basename(_SCRIPT_DIR) == "scripts":
+        return os.path.dirname(_SCRIPT_DIR)
+    return _SCRIPT_DIR
+
+
+def _requirements_file() -> str:
+    return os.path.join(_bundle_root(), _REQUIREMENTS_FILE_NAME)
+
+
 def _refresh_paths() -> None:
-    global _PROJECT_ROOT, _VENV_DIR, _REQUIREMENTS_FILE
+    global _PROJECT_ROOT, _VENV_DIR, _WHEELS_DIR
     _PROJECT_ROOT = _find_project_root()
     _VENV_DIR = _resolve_venv_dir()
-    _REQUIREMENTS_FILE = os.path.join(_PROJECT_ROOT, "requirements.txt")
+    _WHEELS_DIR = _resolve_wheels_dir()
 
 
 _PROJECT_ROOT = _find_project_root()
 _VENV_DIR = _resolve_venv_dir()
-_WHEELS_DIR = os.path.join(_SCRIPT_DIR, "wheels")
-_REQUIREMENTS_FILE = os.path.join(_PROJECT_ROOT, "requirements.txt")
+_WHEELS_DIR = _resolve_wheels_dir()
 
 
 def _is_batocera_system() -> bool:
@@ -82,7 +106,7 @@ def _deploy_source_root() -> str | None:
 def _deploy_ignore(dirpath: str, names: list[str]) -> set[str]:
     ignored = set()
     for name in names:
-        if name in {"venv", "__pycache__", ".lgd-nfy0"}:
+        if name in {"venv", "__pycache__", ".lgd-nfy0", "wheels"}:
             ignored.add(name)
             continue
         full = os.path.join(dirpath, name)
@@ -122,11 +146,21 @@ def deploy_to_batocera(force: bool = False) -> bool:
         )
 
     scripts_dest = os.path.join(_BATOCERA_SYSTEM_DIR, "scripts")
-    for filename in (_CONFIG_FILENAME, "requirements.txt"):
-        src = os.path.join(source_root, filename)
-        if os.path.isfile(src):
-            shutil.copy2(src, os.path.join(scripts_dest, filename))
-            print(f"  {filename} -> {scripts_dest}/")
+    config_src = os.path.join(source_root, _CONFIG_FILENAME)
+    if os.path.isfile(config_src):
+        shutil.copy2(config_src, os.path.join(scripts_dest, _CONFIG_FILENAME))
+        print(f"  {_CONFIG_FILENAME} -> {scripts_dest}/")
+
+    wheels_src = os.path.join(source_root, "wheels")
+    wheels_dst = os.path.join(scripts_dest, "wheels")
+    if os.path.isdir(wheels_src):
+        shutil.copytree(
+            wheels_src,
+            wheels_dst,
+            dirs_exist_ok=True,
+            copy_function=shutil.copy2,
+        )
+        print(f"  wheels/ -> {wheels_dst}")
 
     project_conf = os.path.join(source_root, "batocera.conf")
     dest_conf = os.path.join(_BATOCERA_SYSTEM_DIR, "batocera.conf")
@@ -170,24 +204,23 @@ def _install_dependencies() -> bool:
         print("✗ ERROR: pip not found in venv")
         return False
 
-    if not os.path.isfile(_REQUIREMENTS_FILE):
-        print("⚠ requirements.txt not found")
-        return False
-
-    wheels = [name for name in os.listdir(_WHEELS_DIR) if name.endswith(".whl")] if os.path.isdir(_WHEELS_DIR) else []
+    wheels = (
+        [name for name in os.listdir(_WHEELS_DIR) if name.endswith(".whl")]
+        if os.path.isdir(_WHEELS_DIR)
+        else []
+    )
     if wheels:
-        print(f"Installing dependencies from {len(wheels)} local wheels (offline)...")
+        print(f"Installing {_LUMA_PACKAGE} from {len(wheels)} local wheels (offline)...")
         cmd = [
             pip_path,
             "install",
             "--no-index",
             f"--find-links={_WHEELS_DIR}",
-            "-r",
-            _REQUIREMENTS_FILE,
+            _LUMA_PACKAGE,
         ]
     else:
-        print("⚠ scripts/wheels/ is empty — trying pip over the network...")
-        cmd = [pip_path, "install", "-r", _REQUIREMENTS_FILE]
+        print(f"⚠ wheels/ not found — trying pip over the network ({_LUMA_PACKAGE})...")
+        cmd = [pip_path, "install", _LUMA_PACKAGE]
 
     result = subprocess.run(cmd)
     if result.returncode == 0:
@@ -196,27 +229,34 @@ def _install_dependencies() -> bool:
 
     print("✗ ERROR: Failed to install dependencies")
     if not wheels:
-        print("  Put aarch64 wheels into scripts/wheels/ or run: python scripts/main.py vendor-wheels")
+        print("  Put aarch64 wheels into wheels/ or run: python scripts/main.py vendor-wheels")
     return False
 
 
 def vendor_wheels() -> int:
-    """Скачать wheel-файлы для офлайн-установки (Batocera, aarch64, Python 3.12)."""
-    os.makedirs(_WHEELS_DIR, exist_ok=True)
-    for name in os.listdir(_WHEELS_DIR):
+    """Скачать wheel-файлы в wheels/ (только для разработки, не разворачивается на Batocera)."""
+    wheels_dir = os.path.join(_bundle_root(), "wheels")
+    requirements = _requirements_file()
+    os.makedirs(wheels_dir, exist_ok=True)
+    for name in os.listdir(wheels_dir):
         if name.endswith(".whl"):
-            os.remove(os.path.join(_WHEELS_DIR, name))
+            os.remove(os.path.join(wheels_dir, name))
+
+    if not os.path.isfile(requirements):
+        print(f"✗ ERROR: {requirements} not found")
+        return 1
 
     python_version = f"{sys.version_info.major}.{sys.version_info.minor}"
+    python = _venv_python() if os.path.isfile(_venv_python()) else sys.executable
     cmd = [
-        sys.executable,
+        python,
         "-m",
         "pip",
         "download",
         "-r",
-        _REQUIREMENTS_FILE,
+        requirements,
         "-d",
-        _WHEELS_DIR,
+        wheels_dir,
         "--python-version",
         python_version,
         "--platform",
@@ -229,7 +269,7 @@ def vendor_wheels() -> int:
 
 
 def setup_venv():
-    """Создаёт venv и ставит зависимости (офлайн из scripts/wheels/, если есть)."""
+    """Создаёт venv и ставит luma (офлайн из wheels/, если есть)."""
     if os.path.isdir(_VENV_DIR) and _deps_installed():
         return _VENV_DIR
 
