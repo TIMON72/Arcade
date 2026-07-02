@@ -1,0 +1,24 @@
+<?xml version="1.0"?>
+<gameList parentHash="2759">
+	<game>
+		<path>./doom1_shareware.wad</path>
+		<name>Doom</name>
+		<desc>In Doom, a nameless space marine is posted to a Martian base where secret teleportation experiments are being conducted. One of these experiments goes horribly wrong and "something fragging evil" starts pouring out of the gateways, killing or possessing all the base personnel!
+
+Responding to a frantic distress call from the overrun scientists, the Martian marine unit is quickly sent to Phobos to investigate, where you, the space marine, are left to guard the hangar with only a pistol while the rest of the group proceed inside to discover their worst nightmare. As you advance further, terrifying screams echo through the vast halls, followed by a disturbing silence ... it seems, all your buddies are dead and you're all on your own now - fight back, exterminate every evil creature and get your ticket back home to earth!</desc>
+		<genre>Shooter / 1st person</genre>
+		<image>./images/doom1_shareware-image.png</image>
+		<video>./videos/doom1_shareware-video.mp4</video>
+		<marquee>./images/doom1_shareware-marquee.png</marquee>
+		<thumbnail>./images/doom1_shareware-thumb.png</thumbnail>
+		<rating>0.85</rating>
+		<releasedate>19930101T000000</releasedate>
+		<developer>id Software</developer>
+		<publisher>GT Interactive</publisher>
+		<players>1-4</players>
+		<playcount>2</playcount>
+		<lastplayed>20260701T035635</lastplayed>
+		<md5>f0cefca49926d00903cf57551d901abe</md5>
+		<lang>en</lang>
+	</game>
+</gameList>

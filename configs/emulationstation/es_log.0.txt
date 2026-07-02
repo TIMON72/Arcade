@@ -1,0 +1,4 @@
+1980-01-01 07:00:03	[2103]	ERROR	Error initializing SDL!
+	The video driver did not add any displays
+1980-01-01 07:00:03	[2103]	ERROR	Renderer failed to initialize!
+1980-01-01 07:00:03	[2103]	ERROR	Window failed to initialize!

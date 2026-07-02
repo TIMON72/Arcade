@@ -1,0 +1,23 @@
+<?xml version="1.0"?>
+<gameList parentHash="2664">
+	<game>
+		<path>./Reflectron (aetherbyte).pce</path>
+		<name>Reflectron</name>
+		<desc>You are a Biological Entity Remover Node And Repair Droid (or B.E.R.N.A.R.D. for short), working for the evil robot overlord on his deadly mobile space station. Charged with maintaining the primary laser cannon, B.E.R.N.A.R.D has, however, developed something of a conscience. Instead, he has chosen to defy his master and do his best to stop the cannon's DELTA CRYSTAL from charging up by destroying the MEGA PROTONS with his cranial gun. Will he be able to stop the cannon from decimating another innocent world?</desc>
+		<genre>Action</genre>
+		<image>./images/Reflectron (aetherbyte)-image.png</image>
+		<video>./videos/Reflectron (aetherbyte)-video.mp4</video>
+		<marquee>./images/Reflectron (aetherbyte)-marquee.png</marquee>
+		<thumbnail>./images/Reflectron (aetherbyte)-thumb.png</thumbnail>
+		<developer>Andrew Darovich</developer>
+		<publisher>Aetherbyte</publisher>
+		<players>1</players>
+		<playcount>1</playcount>
+		<lastplayed>20260701T035707</lastplayed>
+		<crc32>6A3727E2</crc32>
+		<md5>40540be45e4f802344cfcb9f43b527b0</md5>
+		<lang>jp</lang>
+		<region>jp</region>
+		<cheevosHash>40540BE45E4F802344CFCB9F43B527B0</cheevosHash>
+	</game>
+</gameList>

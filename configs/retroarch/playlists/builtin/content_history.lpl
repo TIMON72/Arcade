@@ -1,0 +1,36 @@
+{
+  "version": "1.5",
+  "default_core_path": "",
+  "default_core_name": "",
+  "label_display_mode": 0,
+  "right_thumbnail_mode": 0,
+  "left_thumbnail_mode": 0,
+  "thumbnail_match_mode": 0,
+  "sort_mode": 2,
+  "items": [
+    {
+      "path": "/userdata/roms/nes/Battle City (J) [T+Rus1.2 PSCD (07.04.2017)].zip",
+      "label": "",
+      "core_path": "/usr/lib/libretro/fceumm_libretro.so",
+      "core_name": "Nintendo - NES / Famicom (FCEUmm)",
+      "crc32": "",
+      "db_name": ""
+    },
+    {
+      "path": "/userdata/roms/dreamcast/Mortal Kombat Gold (rus).cdi",
+      "label": "",
+      "core_path": "/usr/lib/libretro/flycast_libretro.so",
+      "core_name": "Sega - Dreamcast/Naomi (Flycast)",
+      "crc32": "",
+      "db_name": ""
+    },
+    {
+      "path": "/userdata/roms/nes/Bomberman II (U) [T-Rus uBAH009 (21.09.2017)].zip",
+      "label": "",
+      "core_path": "/usr/lib/libretro/fceumm_libretro.so",
+      "core_name": "Nintendo - NES / Famicom (FCEUmm)",
+      "crc32": "",
+      "db_name": ""
+    }
+  ]
+}
