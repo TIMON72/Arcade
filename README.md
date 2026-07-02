@@ -24,7 +24,6 @@
 ```
 Arcade/
 ├── batocera.conf          # настройки Batocera (system.services=main)
-├── deploy.sh              # скрипт принудительного deploy
 ├── pins.png               # схема распиновки GPIO (BCM)
 ├── requirements.txt       # только для vendor-wheels (не deploy)
 ├── wheels/                # офлайн-пакеты pip (aarch64, Python 3.12)
@@ -75,9 +74,9 @@ Arcade/
 
 Скопируйте **весь** проект на консоль (git clone, SCP, флешка) — нужны каталоги `configs/`, `services/`, `scripts/`, `wheels/` и файл `batocera.conf`. Репозиторий может лежать где угодно, например `/userdata/system/Arcade`.
 
-Deploy копирует файлы в фиксированные пути Batocera: `/userdata/system/scripts`, `/userdata/system/services` и т.д. Запускать deploy нужно **из копии проекта**, а не из `/userdata/system/scripts`.
+Deploy копирует файлы в фиксированные пути Batocera: `/userdata/system/scripts`, `/userdata/system/services` и т.д. Запускать нужно **из копии проекта**, а не из `/userdata/system/scripts`.
 
-### Способ 1: без явного deploy (первый запуск)
+### Первый запуск
 
 При **первом** вызове `main.py` deploy выполняется автоматически (пока нет маркера `/userdata/system/.arcade-deployed`):
 
@@ -92,30 +91,13 @@ python3 scripts/main.py
 2. Перезапишет `batocera.conf` версией из проекта
 3. Создаст маркер `.arcade-deployed`
 4. Создаст `venv` в `/userdata/system/scripts/` и установит `luma` из локальных wheels
-5. Запустит таймер в **текущем** процессе (из каталога `Arcade/`)
+5. Перезапустится из `/userdata/system/scripts/main.py` через `venv/bin/python` и запустит таймер
 
-Для постоянной работы после первого запуска лучше поднять сервис (он использует уже развёрнутый `/userdata/system/scripts/main.py`):
+Повторный `python3 scripts/main.py` из `Arcade/` **не обновит** файлы в `/userdata/system/` — для обновлений используйте `deploy`.
 
-```bash
-batocera-services restart main
-batocera-services status main
-```
+### Обновление файлов
 
-Повторный `python3 scripts/main.py` из `Arcade/` **не обновит** файлы в `/userdata/system/` — для обновлений используйте способ 2.
-
-### Способ 2: явный deploy (обновления и повторная установка)
-
-Принудительно перезаписывает файлы в `/userdata/system/`, даже если deploy уже выполнялся.
-
-**Через скрипт** (рекомендуется):
-
-```bash
-cd /userdata/system/Arcade
-./deploy.sh              # только deploy
-./deploy.sh --restart    # deploy + перезапуск сервиса
-```
-
-**Через main.py** (то же самое, без перезапуска сервиса):
+Принудительно перезаписывает файлы в `/userdata/system/`, даже если deploy уже выполнялся:
 
 ```bash
 cd /userdata/system/Arcade
@@ -123,21 +105,19 @@ python3 scripts/main.py deploy
 batocera-services restart main
 ```
 
-Альтернатива для повторного авто-deploy без `deploy`: удалить маркер и снова запустить `main.py`:
+Альтернатива: удалить маркер и снова запустить `main.py`:
 
 ```bash
 rm /userdata/system/.arcade-deployed
 python3 scripts/main.py
 ```
 
-### Сравнение способов
+### Сравнение команд
 
 | Команда | Deploy | Запуск таймера | Когда использовать |
 |---------|--------|----------------|-------------------|
 | `python3 scripts/main.py` | только первый раз | да | первая установка |
 | `python3 scripts/main.py deploy` | всегда | нет | обновление файлов |
-| `./deploy.sh` | всегда | нет | обновление файлов |
-| `./deploy.sh --restart` | всегда | через сервис | обновление + перезапуск |
 | `batocera-services restart main` | нет | через сервис | обычный перезапуск |
 
 ### Автозапуск при загрузке

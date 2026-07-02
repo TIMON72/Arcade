@@ -17,6 +17,7 @@ from dataclasses import dataclass
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _BATOCERA_SYSTEM_DIR = "/userdata/system"
+_DEPLOYED_SCRIPTS_DIR = os.path.join(_BATOCERA_SYSTEM_DIR, "scripts")
 _DEPLOY_MARKER = os.path.join(_BATOCERA_SYSTEM_DIR, ".arcade-deployed")
 
 
@@ -29,23 +30,31 @@ def _find_project_root() -> str:
     return _SCRIPT_DIR
 
 
+def _is_deployed_scripts() -> bool:
+    return os.path.realpath(_SCRIPT_DIR) == os.path.realpath(_DEPLOYED_SCRIPTS_DIR)
+
+
+def _runtime_scripts_dir() -> str:
+    """На Batocera venv и wheels всегда в /userdata/system/scripts/."""
+    if _is_batocera_system():
+        return _DEPLOYED_SCRIPTS_DIR
+    return _SCRIPT_DIR
+
+
 def _resolve_wheels_dir() -> str:
     """wheels/ в корне репозитория; после deploy — в /userdata/system/scripts/wheels/."""
-    for base in (_SCRIPT_DIR, _find_project_root()):
-        path = os.path.join(base, "wheels")
-        if os.path.isdir(path):
+    candidates = []
+    if _is_batocera_system():
+        candidates.append(os.path.join(_DEPLOYED_SCRIPTS_DIR, "wheels"))
+    candidates.append(os.path.join(_bundle_root(), "wheels"))
+    for path in candidates:
+        if os.path.isdir(path) and any(name.endswith(".whl") for name in os.listdir(path)):
             return path
-    return os.path.join(_find_project_root(), "wheels")
+    return candidates[0] if candidates else os.path.join(_bundle_root(), "wheels")
 
 
 def _resolve_venv_dir() -> str:
-    script_venv = os.path.join(_SCRIPT_DIR, "venv")
-    legacy_venv = os.path.join(os.path.dirname(_SCRIPT_DIR), "venv")
-    if os.path.isdir(script_venv):
-        return script_venv
-    if os.path.isdir(legacy_venv):
-        return legacy_venv
-    return script_venv
+    return os.path.join(_runtime_scripts_dir(), "venv")
 
 
 def _bundle_root() -> str:
@@ -67,11 +76,6 @@ def _refresh_paths() -> None:
     _PROJECT_ROOT = _find_project_root()
     _VENV_DIR = _resolve_venv_dir()
     _WHEELS_DIR = _resolve_wheels_dir()
-
-
-_PROJECT_ROOT = _find_project_root()
-_VENV_DIR = _resolve_venv_dir()
-_WHEELS_DIR = _resolve_wheels_dir()
 
 
 def _is_batocera_system() -> bool:
@@ -99,6 +103,11 @@ def _deploy_source_root() -> str | None:
         if parent == current:
             return None
         current = parent
+
+
+_PROJECT_ROOT = _find_project_root()
+_VENV_DIR = _resolve_venv_dir()
+_WHEELS_DIR = _resolve_wheels_dir()
 
 
 def _deploy_ignore(dirpath: str, names: list[str]) -> set[str]:
@@ -195,12 +204,33 @@ def _venv_python() -> str:
     return os.path.join(_VENV_DIR, "bin", "python")
 
 
-def _deps_installed() -> bool:
-    try:
-        import luma.led_matrix  # noqa: F401
-        return True
-    except ImportError:
+def _deps_installed(python_path: str | None = None) -> bool:
+    python = python_path or _venv_python()
+    if not os.path.isfile(python):
         return False
+    result = subprocess.run(
+        [python, "-c", "import luma.led_matrix"],
+        capture_output=True,
+        check=False,
+    )
+    return result.returncode == 0
+
+
+def _entry_script() -> str:
+    if _is_batocera_system() and not _is_deployed_scripts():
+        return os.path.join(_DEPLOYED_SCRIPTS_DIR, "main.py")
+    return os.path.join(_SCRIPT_DIR, "main.py")
+
+
+def _reexec_into_runtime() -> None:
+    """Дочерние процессы multiprocessing должны стартовать через venv/bin/python."""
+    venv_python = _venv_python()
+    if not os.path.isfile(venv_python):
+        return
+    if os.path.realpath(sys.executable) == os.path.realpath(venv_python):
+        return
+    main_script = _entry_script()
+    os.execv(venv_python, [venv_python, main_script, *sys.argv[1:]])
 
 
 def _install_dependencies() -> bool:
@@ -275,7 +305,8 @@ def vendor_wheels() -> int:
 
 def setup_venv():
     """Создаёт venv и ставит luma (офлайн из wheels/, если есть)."""
-    if os.path.isdir(_VENV_DIR) and _deps_installed():
+    venv_python = _venv_python()
+    if os.path.isdir(_VENV_DIR) and _deps_installed(venv_python):
         return _VENV_DIR
 
     if not os.path.isdir(_VENV_DIR):
@@ -289,7 +320,7 @@ def setup_venv():
             print(f"✗ ERROR: Failed to create venv: {error}")
             sys.exit(1)
 
-    if not _deps_installed():
+    if not _deps_installed(venv_python):
         if not _install_dependencies():
             sys.exit(1)
 
@@ -297,31 +328,23 @@ def setup_venv():
     return _VENV_DIR
 
 
-def activate_venv():
-    """Активирует venv путём обновления PATH."""
-    bin_dir = os.path.join(_VENV_DIR, "bin")
-
-    if os.path.isdir(bin_dir):
-        os.environ["PATH"] = f"{bin_dir}:{os.environ.get('PATH', '')}"
-        os.environ["VIRTUAL_ENV"] = _VENV_DIR
-        print(f"✓ Virtual environment activated: {_VENV_DIR}")
-    else:
-        print("⚠ WARNING: venv bin directory not found")
-
 # Инициализируем venv на старте
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "vendor-wheels":
         raise SystemExit(vendor_wheels())
     if len(sys.argv) > 1 and sys.argv[1] == "deploy":
-        raise SystemExit(0 if deploy_to_batocera(force=True) else 1)
+        ok = deploy_to_batocera(force=True)
+        if ok:
+            _refresh_paths()
+            setup_venv()
+        raise SystemExit(0 if ok else 1)
     if deploy_to_batocera():
         _refresh_paths()
-    # Проверяем что мы НЕ уже внутри venv
-    if "VIRTUAL_ENV" not in os.environ:
-        print("Initializing virtual environment...")
-        venv_dir = setup_venv()
-        activate_venv()
-        print("Ready to import dependencies\n")
+    _refresh_paths()
+    print("Initializing virtual environment...")
+    setup_venv()
+    _reexec_into_runtime()
+    print("Ready to import dependencies\n")
 
 # ============================================================================
 # ОСНОВНОЙ КОД
