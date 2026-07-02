@@ -1,6 +1,7 @@
 #!/usr/bin/python3
 import os
 import sys
+import shutil
 import subprocess
 import venv as venv_module
 import multiprocessing
@@ -11,69 +12,265 @@ import tomllib
 from dataclasses import dataclass
 
 # ============================================================================
-# ВИРТУАЛЬНАЯ СРЕДА - Инициализация
+# ВИРТУАЛЬНАЯ СРЕДА И РАЗВЁРТЫВАНИЕ НА BATOCERA
 # ============================================================================
 
-def setup_venv():
-    """Проверяет и создает venv если необходимо"""
-    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    venv_dir = os.path.join(project_root, "venv")
-    
-    # Если venv уже существует - всё ок
-    if os.path.isdir(venv_dir):
-        return venv_dir
-    
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_BATOCERA_SYSTEM_DIR = "/userdata/system"
+_DEPLOY_MARKER = os.path.join(_BATOCERA_SYSTEM_DIR, ".arcade-deployed")
+
+
+_CONFIG_FILENAME = "config_timer.toml"
+
+
+def _find_project_root() -> str:
+    if os.path.isfile(os.path.join(_SCRIPT_DIR, _CONFIG_FILENAME)):
+        return _SCRIPT_DIR
+    return os.path.dirname(_SCRIPT_DIR)
+
+
+def _resolve_venv_dir() -> str:
+    script_venv = os.path.join(_SCRIPT_DIR, "venv")
+    legacy_venv = os.path.join(os.path.dirname(_SCRIPT_DIR), "venv")
+    if os.path.isdir(script_venv):
+        return script_venv
+    if os.path.isdir(legacy_venv):
+        return legacy_venv
+    return script_venv
+
+
+def _refresh_paths() -> None:
+    global _PROJECT_ROOT, _VENV_DIR, _REQUIREMENTS_FILE
+    _PROJECT_ROOT = _find_project_root()
+    _VENV_DIR = _resolve_venv_dir()
+    _REQUIREMENTS_FILE = os.path.join(_PROJECT_ROOT, "requirements.txt")
+
+
+_PROJECT_ROOT = _find_project_root()
+_VENV_DIR = _resolve_venv_dir()
+_WHEELS_DIR = os.path.join(_SCRIPT_DIR, "wheels")
+_REQUIREMENTS_FILE = os.path.join(_PROJECT_ROOT, "requirements.txt")
+
+
+def _is_batocera_system() -> bool:
+    return os.path.isdir(_BATOCERA_SYSTEM_DIR) and (
+        os.path.isfile(os.path.join(_BATOCERA_SYSTEM_DIR, "batocera.conf"))
+        or os.path.isfile("/boot/batocera")
+    )
+
+
+def _deploy_source_root() -> str | None:
+    """Корень проекта с configs/, services/, scripts/ — может быть где угодно."""
+    deployed_scripts = os.path.realpath(os.path.join(_BATOCERA_SYSTEM_DIR, "scripts"))
+    if os.path.realpath(_SCRIPT_DIR) == deployed_scripts:
+        return None
+
+    current = os.path.realpath(_SCRIPT_DIR)
+    while True:
+        has_bundle = all(
+            os.path.isdir(os.path.join(current, name))
+            for name in ("configs", "services", "scripts")
+        )
+        if has_bundle and os.path.isfile(os.path.join(current, "batocera.conf")):
+            return current
+        parent = os.path.dirname(current)
+        if parent == current:
+            return None
+        current = parent
+
+
+def _deploy_ignore(dirpath: str, names: list[str]) -> set[str]:
+    ignored = set()
+    for name in names:
+        if name in {"venv", "__pycache__", ".lgd-nfy0"}:
+            ignored.add(name)
+            continue
+        full = os.path.join(dirpath, name)
+        if not os.path.isfile(full) and not os.path.isdir(full) and not os.path.islink(full):
+            ignored.add(name)
+    return ignored
+
+
+def deploy_to_batocera(force: bool = False) -> bool:
+    """Первое развёртывание в /userdata/system/ с перезаписью; далее — пропуск (см. .arcade-deployed)."""
+    if not _is_batocera_system():
+        return False
+
+    source_root = _deploy_source_root()
+    if source_root is None:
+        return False
+
+    if os.path.isfile(_DEPLOY_MARKER) and not force:
+        return False
+
+    action = "re-deploy" if force else "first-time deploy"
     print("=" * 60)
-    print("Virtual environment not found. Creating...")
+    print(f"Batocera: {action} to /userdata/system/ (overwrite existing)...")
+    print(f"  source: {source_root}")
     print("=" * 60)
-    
+
+    for folder in ("configs", "services", "scripts"):
+        src = os.path.join(source_root, folder)
+        dst = os.path.join(_BATOCERA_SYSTEM_DIR, folder)
+        print(f"  {folder}/ -> {dst}")
+        shutil.copytree(
+            src,
+            dst,
+            dirs_exist_ok=True,
+            ignore=_deploy_ignore,
+            copy_function=shutil.copy2,
+        )
+
+    scripts_dest = os.path.join(_BATOCERA_SYSTEM_DIR, "scripts")
+    for filename in (_CONFIG_FILENAME, "requirements.txt"):
+        src = os.path.join(source_root, filename)
+        if os.path.isfile(src):
+            shutil.copy2(src, os.path.join(scripts_dest, filename))
+            print(f"  {filename} -> {scripts_dest}/")
+
+    project_conf = os.path.join(source_root, "batocera.conf")
+    dest_conf = os.path.join(_BATOCERA_SYSTEM_DIR, "batocera.conf")
+    if os.path.isfile(project_conf):
+        shutil.copy2(project_conf, dest_conf)
+        print(f"  batocera.conf -> {dest_conf}")
+
+    service_main = os.path.join(_BATOCERA_SYSTEM_DIR, "services", "main")
+    if os.path.isfile(service_main):
+        os.chmod(service_main, 0o755)
+
+    with open(_DEPLOY_MARKER, "w", encoding="utf-8") as marker:
+        marker.write(f"{source_root}\n")
+
+    print("✓ Batocera deployment complete")
+    print(f"  marker: {_DEPLOY_MARKER}")
+    print("  Service: /userdata/system/services/main {start|stop|status}")
+    print("=" * 60)
+    return True
+
+
+def _venv_pip() -> str:
+    return os.path.join(_VENV_DIR, "bin", "pip")
+
+
+def _venv_python() -> str:
+    return os.path.join(_VENV_DIR, "bin", "python")
+
+
+def _deps_installed() -> bool:
     try:
-        # Создаём venv
-        venv_module.create(venv_dir, with_pip=True)
-        print(f"✓ Virtual environment created: {venv_dir}")
-    except Exception as e:
-        print(f"✗ ERROR: Failed to create venv: {e}")
-        sys.exit(1)
-    
-    # Получаем путь к pip в venv
-    pip_path = os.path.join(venv_dir, "bin", "pip")
-    
-    # Обновляем pip
-    print("Upgrading pip...")
-    subprocess.run([pip_path, "install", "--upgrade", "pip", "setuptools", "wheel"], 
-                   capture_output=True)
-    
-    # Устанавливаем зависимости
-    requirements_file = os.path.join(project_root, "requirements.txt")
-    if os.path.isfile(requirements_file):
-        print("Installing dependencies...")
-        result = subprocess.run([pip_path, "install", "-r", requirements_file])
-        if result.returncode == 0:
-            print("✓ Dependencies installed")
-        else:
-            print("✗ WARNING: Some dependencies failed to install")
-    else:
+        import luma.led_matrix  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def _install_dependencies() -> bool:
+    pip_path = _venv_pip()
+    if not os.path.isfile(pip_path):
+        print("✗ ERROR: pip not found in venv")
+        return False
+
+    if not os.path.isfile(_REQUIREMENTS_FILE):
         print("⚠ requirements.txt not found")
-    
+        return False
+
+    wheels = [name for name in os.listdir(_WHEELS_DIR) if name.endswith(".whl")] if os.path.isdir(_WHEELS_DIR) else []
+    if wheels:
+        print(f"Installing dependencies from {len(wheels)} local wheels (offline)...")
+        cmd = [
+            pip_path,
+            "install",
+            "--no-index",
+            f"--find-links={_WHEELS_DIR}",
+            "-r",
+            _REQUIREMENTS_FILE,
+        ]
+    else:
+        print("⚠ scripts/wheels/ is empty — trying pip over the network...")
+        cmd = [pip_path, "install", "-r", _REQUIREMENTS_FILE]
+
+    result = subprocess.run(cmd)
+    if result.returncode == 0:
+        print("✓ Dependencies installed")
+        return True
+
+    print("✗ ERROR: Failed to install dependencies")
+    if not wheels:
+        print("  Put aarch64 wheels into scripts/wheels/ or run: python scripts/main.py vendor-wheels")
+    return False
+
+
+def vendor_wheels() -> int:
+    """Скачать wheel-файлы для офлайн-установки (Batocera, aarch64, Python 3.12)."""
+    os.makedirs(_WHEELS_DIR, exist_ok=True)
+    for name in os.listdir(_WHEELS_DIR):
+        if name.endswith(".whl"):
+            os.remove(os.path.join(_WHEELS_DIR, name))
+
+    python_version = f"{sys.version_info.major}.{sys.version_info.minor}"
+    cmd = [
+        sys.executable,
+        "-m",
+        "pip",
+        "download",
+        "-r",
+        _REQUIREMENTS_FILE,
+        "-d",
+        _WHEELS_DIR,
+        "--python-version",
+        python_version,
+        "--platform",
+        "manylinux2014_aarch64",
+        "--only-binary=:all:",
+    ]
+    print("Downloading wheels for offline install...")
+    print(" ".join(cmd))
+    return subprocess.call(cmd)
+
+
+def setup_venv():
+    """Создаёт venv и ставит зависимости (офлайн из scripts/wheels/, если есть)."""
+    if os.path.isdir(_VENV_DIR) and _deps_installed():
+        return _VENV_DIR
+
+    if not os.path.isdir(_VENV_DIR):
+        print("=" * 60)
+        print("Virtual environment not found. Creating...")
+        print("=" * 60)
+        try:
+            venv_module.create(_VENV_DIR, with_pip=True, system_site_packages=True)
+            print(f"✓ Virtual environment created: {_VENV_DIR}")
+        except Exception as error:
+            print(f"✗ ERROR: Failed to create venv: {error}")
+            sys.exit(1)
+
+    if not _deps_installed():
+        if not _install_dependencies():
+            sys.exit(1)
+
     print("=" * 60)
-    return venv_dir
+    return _VENV_DIR
+
 
 def activate_venv():
-    """Активирует venv путём обновления PATH"""
-    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    venv_dir = os.path.join(project_root, "venv")
-    bin_dir = os.path.join(venv_dir, "bin")
-    
-    # Обновляем PATH чтобы использовать venv Python
+    """Активирует venv путём обновления PATH."""
+    bin_dir = os.path.join(_VENV_DIR, "bin")
+
     if os.path.isdir(bin_dir):
         os.environ["PATH"] = f"{bin_dir}:{os.environ.get('PATH', '')}"
-        os.environ["VIRTUAL_ENV"] = venv_dir
-        print(f"✓ Virtual environment activated: {venv_dir}")
+        os.environ["VIRTUAL_ENV"] = _VENV_DIR
+        print(f"✓ Virtual environment activated: {_VENV_DIR}")
     else:
         print("⚠ WARNING: venv bin directory not found")
 
 # Инициализируем venv на старте
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "vendor-wheels":
+        raise SystemExit(vendor_wheels())
+    if len(sys.argv) > 1 and sys.argv[1] == "deploy":
+        raise SystemExit(0 if deploy_to_batocera(force=True) else 1)
+    if deploy_to_batocera():
+        _refresh_paths()
     # Проверяем что мы НЕ уже внутри venv
     if "VIRTUAL_ENV" not in os.environ:
         print("Initializing virtual environment...")
@@ -85,10 +282,10 @@ if __name__ == "__main__":
 # ОСНОВНОЙ КОД
 # ============================================================================
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
+SCRIPT_DIR = _SCRIPT_DIR
+PROJECT_ROOT = _find_project_root()
 LOG_FILE = os.path.join(PROJECT_ROOT, "logs.log")
-CONFIG_PATH = os.path.join(PROJECT_ROOT, "config.toml")
+CONFIG_PATH = os.path.join(PROJECT_ROOT, _CONFIG_FILENAME)
 
 
 @dataclass(frozen=True)
@@ -115,8 +312,6 @@ class MatrixConfig:
     brightness: int = 7
     scroll_speed: int = 7
     text_display: str = "АРЕНДА: т. +79233549295"
-    spi_port: int = 10
-    spi_device: int = 0
     din: int = 10
     clk: int = 11
     cs: int = 8
@@ -125,7 +320,6 @@ class MatrixConfig:
     rotate: int = 2
     blocks_reverse: bool = True
     test_on_start: bool = True
-    interface: str = "bitbang"
 
 
 def _read_positive_int(section: dict, key: str, default: int) -> int:
@@ -271,8 +465,6 @@ def load_matrix_config() -> MatrixConfig:
         brightness=_read_brightness(matrix_section, "brightness", defaults.brightness),
         scroll_speed=_read_positive_int(matrix_section, "scroll_speed", defaults.scroll_speed),
         text_display=_read_string(matrix_section, "text_display", defaults.text_display),
-        spi_port=_read_non_negative_int(matrix_section, "spi_port", defaults.spi_port),
-        spi_device=_read_non_negative_int(matrix_section, "spi_device", defaults.spi_device),
         din=_read_bcm_pin(matrix_section, "din", defaults.din),
         clk=_read_bcm_pin(matrix_section, "clk", defaults.clk),
         cs=_read_bcm_pin(matrix_section, "cs", defaults.cs),
@@ -283,7 +475,6 @@ def load_matrix_config() -> MatrixConfig:
         rotate=_read_rotate(matrix_section, "rotate", defaults.rotate),
         blocks_reverse=_read_bool(matrix_section, "blocks_reverse", defaults.blocks_reverse),
         test_on_start=_read_bool(matrix_section, "test_on_start", defaults.test_on_start),
-        interface=_read_string(matrix_section, "interface", defaults.interface),
     )
 
 
@@ -492,11 +683,9 @@ def main():
         gpio_config.relay_active_low,
     )
     logging.info(
-        "Matrix config: enabled=%s brightness=%d spi=%d:%d din/clk/cs=%d/%d/%d cascaded=%d",
+        "Matrix config: enabled=%s brightness=%d din/clk/cs=%d/%d/%d cascaded=%d",
         matrix_config.enabled,
         matrix_config.brightness,
-        matrix_config.spi_port,
-        matrix_config.spi_device,
         matrix_config.din,
         matrix_config.clk,
         matrix_config.cs,

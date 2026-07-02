@@ -1,7 +1,7 @@
 #!/bin/bash
 
 ROOT="/userdata/system/scripts"
-SCRIPT="$ROOT/scripts/main.py"
+SCRIPT="$ROOT/main.py"
 PIDFILE="/var/run/main-service.pid"
 LOG="/userdata/system/logs/main-service.log"
 PYTHON="$ROOT/venv/bin/python"

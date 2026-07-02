@@ -36,7 +36,7 @@ class Button:
         return False
 
 
-# Пины GPIO и реле — из config.toml [gpio]
+# Пины GPIO и реле — из config_timer.toml [gpio]
 _gpio_cfg = app_main.gpio_config
 
 RF_INCREASE = _gpio_cfg.rf_increase
@@ -141,21 +141,17 @@ def setup_matrix_display():
             block_orientation=matrix_cfg.block_orientation,
             rotate=matrix_cfg.rotate,
             brightness=matrix_cfg.brightness,
-            spi_port=matrix_cfg.spi_port,
-            spi_device=matrix_cfg.spi_device,
             din=matrix_cfg.din,
             clk=matrix_cfg.clk,
             cs=matrix_cfg.cs,
-            interface=matrix_cfg.interface,
             blocks_reverse=matrix_cfg.blocks_reverse,
         )
         if matrix_cfg.test_on_start:
             matrix.run_self_test()
         matrix.start_scrolling_text(matrix_cfg.text_display, speed=matrix_cfg.scroll_speed)
         _matrix_ready = True
-        driver = matrix_cfg.interface
         print(
-            f"Matrix: MAX7219 initialized ({driver}, "
+            f"Matrix: MAX7219 initialized (bitbang, "
             f"DIN/CLK/CS={matrix_cfg.din}/{matrix_cfg.clk}/{matrix_cfg.cs}, "
             f"cascaded={matrix_cfg.cascaded})"
         )

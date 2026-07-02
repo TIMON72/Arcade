@@ -1,37 +1,14 @@
 """
-Драйвер MAX7219 для Raspberry Pi 5 через luma.led_matrix.
+Драйвер MAX7219 для Raspberry Pi 5 через luma.led_matrix (bitbang SPI + lgpio).
 
-Ближайший аналог GyverMAX7219 + RunningGFX из Arduino-проекта:
-  matrix.begin()      -> setup_matrix()
-  matrix.setBright()  -> set_brightness()
-  matrix.clear()      -> clear()
-  matrix.dot(x, y)    -> dot() + flush()
-  matrix_run.tick()   -> scroll_tick()
+Ближайший аналог GyverMAX7219 + RunningGFX из Arduino-проекта.
 """
-
-import sys
-
-
-def _ensure_spidev():
-    try:
-        import spidev  # noqa: F401
-    except ImportError:
-        from modules import spidev_compat
-
-        sys.modules["spidev"] = spidev_compat
-
-
-_ensure_spidev()
 
 import os
 import time
 
 from PIL import Image
-
-from luma.core.interface.serial import bitbang, noop, spi
-from luma.core.legacy import text
-from luma.core.legacy.font import CP437_FONT, proportional
-from luma.core.render import canvas
+from luma.core.interface.serial import bitbang
 from luma.led_matrix.device import max7219
 
 # Пины SPI по умолчанию (BCM) — физ. пины 19, 23, 24 на Pi 4
@@ -43,8 +20,6 @@ MATRIX_CS = 8     # CE0
 CASCADED_MODULES = 4
 BLOCK_ORIENTATION = 90
 ROTATE = 2
-SPI_PORT = 10
-SPI_DEVICE = 0
 
 _device = None
 _framebuffer = None
@@ -118,26 +93,19 @@ def setup_matrix(
     block_orientation=BLOCK_ORIENTATION,
     rotate=ROTATE,
     brightness=7,
-    spi_port=SPI_PORT,
-    spi_device=SPI_DEVICE,
     din=MATRIX_DIN,
     clk=MATRIX_CLK,
     cs=MATRIX_CS,
-    interface="bitbang",
     blocks_reverse=False,
 ):
     """Инициализация матрицы (аналог matrix.begin() + setBright())."""
     global _device, _framebuffer, _scroll_runner, MATRIX_DIN, MATRIX_CLK, MATRIX_CS
     MATRIX_DIN, MATRIX_CLK, MATRIX_CS = din, clk, cs
 
-    if interface == "bitbang":
-        from modules.lgpio_gpio import LgpioGPIO
+    from modules.lgpio_gpio import LgpioGPIO
 
-        serial = bitbang(gpio=LgpioGPIO(), SCLK=clk, SDA=din, CE=cs)
-        print(f"Matrix: bitbang SPI on DIN={din} CLK={clk} CS={cs}")
-    else:
-        serial = spi(port=spi_port, device=spi_device, gpio=noop())
-        print(f"Matrix: hardware SPI /dev/spidev{spi_port}.{spi_device}")
+    serial = bitbang(gpio=LgpioGPIO(), SCLK=clk, SDA=din, CE=cs)
+    print(f"Matrix: bitbang SPI on DIN={din} CLK={clk} CS={cs}")
 
     _device = max7219(
         serial,
@@ -171,10 +139,6 @@ def run_self_test(hold_s=1.5) -> bool:
     except Exception as error:
         print(f"Matrix: self-test failed: {error}")
         return False
-
-
-def is_ready():
-    return _device is not None
 
 
 def start_scrolling_text(message, speed=7):
@@ -230,58 +194,6 @@ def dot(x, y, on=True):
         return
     _ensure_framebuffer()
     _framebuffer.putpixel((x, y), 1 if on else 0)
-
-
-def show_scrolling_text(message, speed=7):
-    """Блокирующая бегущая строка (bitmap font5x8)."""
-    if _device is None:
-        return
-    delay_s = max(0.01, 0.12 - speed * 0.007)
-    backing, max_scroll = _build_scroll_backing(message)
-    for scroll_x in range(max_scroll + 1):
-        frame = backing.crop((scroll_x, 0, scroll_x + _device.width, _device.height))
-        _device.display(frame)
-        time.sleep(delay_s)
-
-
-def show_static_text(message):
-    """Короткий текст без прокрутки."""
-    if _device is None:
-        return
-    stop_scrolling()
-    with canvas(_device) as draw:
-        text(draw, (0, 0), message, fill="white", font=proportional(CP437_FONT))
-
-
-def show_time(hours, minutes, seconds):
-    """Вывод MM:SS или HH:MM."""
-    if _device is None:
-        return
-    stop_scrolling()
-    if hours > 0:
-        message = f"{hours:02d}:{minutes:02d}"
-    else:
-        message = f"{minutes:02d}:{seconds:02d}"
-    with canvas(_device) as draw:
-        text(draw, (0, 0), message, fill="white", font=proportional(CP437_FONT))
-
-
-def show_waiting_time(seconds):
-    """Режим ожидания: $?SS (аналог matrixPrintWaitingTime)."""
-    if _device is None:
-        return
-    stop_scrolling()
-    with canvas(_device) as draw:
-        text(draw, (0, 0), f"$?{seconds:02d}", fill="white", font=proportional(CP437_FONT))
-
-
-def show_countdown(count):
-    """Обратный отсчёт перед стартом (аналог matrixPrintStart)."""
-    if _device is None:
-        return
-    stop_scrolling()
-    with canvas(_device) as draw:
-        text(draw, (0, 0), f"IGRA {count}", fill="white", font=proportional(CP437_FONT))
 
 
 def _blit_glyph(glyph, offset_x, offset_y):

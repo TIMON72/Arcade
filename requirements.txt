@@ -1,4 +1,3 @@
-lgpio>=0.2.2.0
-aiohttp>=3.9.0
-luma.led_matrix>=1.9.0
-# spidev не обязателен: на Batocera без gcc используется scripts/modules/spidev_compat.py
+# Зафиксированные версии; wheel-файлы в scripts/wheels/ (aarch64, Python 3.12).
+# Обновление: python scripts/main.py vendor-wheels
+luma.led_matrix==1.9.0
