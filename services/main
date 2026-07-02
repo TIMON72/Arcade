@@ -57,6 +57,12 @@ status() {
         echo "(log not found: $LOG — restart service after first start)"
     fi
 
+    local app_log="$ROOT/logs.log"
+    if [ -f "$app_log" ]; then
+        echo "--- last ${lines} lines: ${app_log} ---"
+        tail -n "$lines" "$app_log"
+    fi
+
     return "$exit_code"
 }
 case "$1" in

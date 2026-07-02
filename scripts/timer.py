@@ -36,7 +36,7 @@ class Button:
         return False
 
 
-# Пины GPIO и реле — из config_timer.toml [gpio]
+# Пины GPIO и реле — из config_main.toml [gpio]
 _gpio_cfg = app_main.gpio_config
 
 RF_INCREASE = _gpio_cfg.rf_increase
@@ -521,7 +521,6 @@ def setup():
     global h, b_increase, b_playpause, b_stop, gpio_pins_available
     if h is not None and any(gpio_pins_available.values()):
         return
-    app_main.cleanup_stale_project_processes(log=print)
     print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - Timer started")
     print(f"Config: time_step={time_step} min, time_wait={time_wait} sec, time_reset={time_reset} min")
     print(

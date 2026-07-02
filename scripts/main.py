@@ -20,15 +20,13 @@ _BATOCERA_SYSTEM_DIR = "/userdata/system"
 _DEPLOY_MARKER = os.path.join(_BATOCERA_SYSTEM_DIR, ".arcade-deployed")
 
 
-_CONFIG_FILENAME = "config_timer.toml"
+_CONFIG_FILENAME = "config_main.toml"
 _LUMA_PACKAGE = "luma.led_matrix==1.9.0"
 _REQUIREMENTS_FILE_NAME = "requirements.txt"
 
 
 def _find_project_root() -> str:
-    if os.path.isfile(os.path.join(_SCRIPT_DIR, _CONFIG_FILENAME)):
-        return _SCRIPT_DIR
-    return os.path.dirname(_SCRIPT_DIR)
+    return _SCRIPT_DIR
 
 
 def _resolve_wheels_dir() -> str:
@@ -115,6 +113,16 @@ def _deploy_ignore(dirpath: str, names: list[str]) -> set[str]:
     return ignored
 
 
+def _fix_shell_line_endings(path: str) -> None:
+    """CRLF в shebang ломает запуск: cannot execute: required file not found."""
+    with open(path, "rb") as script_file:
+        data = script_file.read()
+    if b"\r" not in data:
+        return
+    with open(path, "wb") as script_file:
+        script_file.write(data.replace(b"\r\n", b"\n").replace(b"\r", b"\n"))
+
+
 def deploy_to_batocera(force: bool = False) -> bool:
     """Первое развёртывание в /userdata/system/ с перезаписью; далее — пропуск (см. .arcade-deployed)."""
     if not _is_batocera_system():
@@ -146,10 +154,6 @@ def deploy_to_batocera(force: bool = False) -> bool:
         )
 
     scripts_dest = os.path.join(_BATOCERA_SYSTEM_DIR, "scripts")
-    config_src = os.path.join(source_root, _CONFIG_FILENAME)
-    if os.path.isfile(config_src):
-        shutil.copy2(config_src, os.path.join(scripts_dest, _CONFIG_FILENAME))
-        print(f"  {_CONFIG_FILENAME} -> {scripts_dest}/")
 
     wheels_src = os.path.join(source_root, "wheels")
     wheels_dst = os.path.join(scripts_dest, "wheels")
@@ -170,6 +174,7 @@ def deploy_to_batocera(force: bool = False) -> bool:
 
     service_main = os.path.join(_BATOCERA_SYSTEM_DIR, "services", "main")
     if os.path.isfile(service_main):
+        _fix_shell_line_endings(service_main)
         os.chmod(service_main, 0o755)
 
     with open(_DEPLOY_MARKER, "w", encoding="utf-8") as marker:
@@ -325,7 +330,12 @@ if __name__ == "__main__":
 SCRIPT_DIR = _SCRIPT_DIR
 PROJECT_ROOT = _find_project_root()
 LOG_FILE = os.path.join(PROJECT_ROOT, "logs.log")
-CONFIG_PATH = os.path.join(PROJECT_ROOT, _CONFIG_FILENAME)
+CONFIG_PATH = os.path.join(SCRIPT_DIR, _CONFIG_FILENAME)
+
+
+@dataclass(frozen=True)
+class ServerConfig:
+    port: int = 5000
 
 
 @dataclass(frozen=True)
@@ -446,6 +456,23 @@ def _read_rotate(section: dict, key: str, default: int) -> int:
     return value
 
 
+def load_server_config() -> ServerConfig:
+    defaults = ServerConfig()
+    if not os.path.isfile(CONFIG_PATH):
+        return defaults
+
+    with open(CONFIG_PATH, "rb") as config_file:
+        data = tomllib.load(config_file)
+
+    server_section = data.get("server", {})
+    if not isinstance(server_section, dict):
+        raise ValueError("[server] section must be a table")
+
+    return ServerConfig(
+        port=_read_positive_int(server_section, "port", defaults.port),
+    )
+
+
 def load_gpio_config() -> GpioConfig:
     defaults = GpioConfig()
     if not os.path.isfile(CONFIG_PATH):
@@ -519,6 +546,7 @@ def load_matrix_config() -> MatrixConfig:
 
 
 try:
+    server_config = load_server_config()
     timer_config = load_timer_config()
     gpio_config = load_gpio_config()
     matrix_config = load_matrix_config()
@@ -697,7 +725,8 @@ def main():
         level=logging.INFO,
         format='%(asctime)s - %(levelname)s - %(message)s',
         handlers=[
-            logging.FileHandler(LOG_FILE, encoding='utf-8')
+            logging.FileHandler(LOG_FILE, encoding='utf-8'),
+            logging.StreamHandler(sys.stderr),
         ]
     )
 
@@ -706,6 +735,7 @@ def main():
     signal.signal(signal.SIGINT, signal_handler)
     
     logging.info("MAIN service STARTED")
+    logging.info("Server config: port=%d", server_config.port)
     logging.info(
         "Timer config: time_step=%d min, time_wait=%d sec, time_reset=%d min",
         timer_config.time_step,
@@ -746,9 +776,9 @@ def main():
     try:
         # Запускаем server.py в отдельном процессе
         server_process = multiprocessing.Process(
-            target=server.server_start_async, 
-            args=(queue_main,),
-            daemon=False  # Явно отмечаем как non-daemon
+            target=server.server_start_async,
+            args=(queue_main, "0.0.0.0", server_config.port),
+            daemon=False
         )
         server_process.start()
         logging.info("'server.py' started (PID: %d)", server_process.pid)

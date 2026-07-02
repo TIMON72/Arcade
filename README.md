@@ -17,14 +17,15 @@
 | Стоп | «КОНЕЦ» → пауза → снова бегущая строка |
 | Время выставлено, игра не запущена | Автосброс через `time_reset` минут |
 
-Веб-сервер (`aiohttp`) на порту **5000**: `GET /test?action=...` для удалённых команд.
+Веб-сервер (`aiohttp`): порт из `[server]` в конфиге (по умолчанию **5000**): `GET /test?action=...` для удалённых команд.
 
 ## Структура репозитория
 
 ```
 Arcade/
 ├── batocera.conf          # настройки Batocera (system.services=main)
-├── config_timer.toml      # конфиг таймера, GPIO и матрицы
+├── deploy.sh              # скрипт принудительного deploy
+├── pins.png               # схема распиновки GPIO (BCM)
 ├── requirements.txt       # только для vendor-wheels (не deploy)
 ├── wheels/                # офлайн-пакеты pip (aarch64, Python 3.12)
 ├── configs/               # пользовательские конфиги Batocera
@@ -32,6 +33,7 @@ Arcade/
 │   └── main               # сервис Batocera (start/stop/status)
 └── scripts/
     ├── main.py            # точка входа, deploy, venv
+    ├── config_main.toml   # конфиг сервера, таймера, GPIO и матрицы
     ├── timer.py           # логика таймера и GPIO
     ├── server.py          # веб-сервер
     └── modules/
@@ -53,7 +55,7 @@ Arcade/
     ├── main.py
     ├── modules/
     ├── wheels/            # копия из репозитория
-    ├── config_timer.toml
+    ├── config_main.toml
     └── venv/              # создаётся при первом запуске
 ```
 
@@ -69,57 +71,114 @@ Arcade/
 
 Интернет на консоли **не обязателен** — wheel-файлы включены в репозиторий.
 
-## Первый запуск на Batocera
+## Развёртывание на Batocera
 
-1. Скопируйте проект на консоль (git clone, SCP, флешка).
-2. Запустите из каталога проекта:
+Скопируйте **весь** проект на консоль (git clone, SCP, флешка) — нужны каталоги `configs/`, `services/`, `scripts/`, `wheels/` и файл `batocera.conf`. Репозиторий может лежать где угодно, например `/userdata/system/Arcade`.
+
+Deploy копирует файлы в фиксированные пути Batocera: `/userdata/system/scripts`, `/userdata/system/services` и т.д. Запускать deploy нужно **из копии проекта**, а не из `/userdata/system/scripts`.
+
+### Способ 1: без явного deploy (первый запуск)
+
+При **первом** вызове `main.py` deploy выполняется автоматически (пока нет маркера `/userdata/system/.arcade-deployed`):
 
 ```bash
+cd /userdata/system/Arcade
 python3 scripts/main.py
 ```
 
-При первом запуске автоматически:
+Что произойдёт:
 
-- развернёт `configs/`, `services/`, `scripts/`, `wheels/`, `config_timer.toml` в `/userdata/system/`;
-- перезапишет `batocera.conf` версией из проекта;
-- создаст маркер `/userdata/system/.arcade-deployed`;
-- создаст `venv` в `scripts/` и установит `luma` из локальных wheels.
+1. Скопирует `configs/`, `services/`, `scripts/` (включая `config_main.toml`), `wheels/` в `/userdata/system/`
+2. Перезапишет `batocera.conf` версией из проекта
+3. Создаст маркер `.arcade-deployed`
+4. Создаст `venv` в `/userdata/system/scripts/` и установит `luma` из локальных wheels
+5. Запустит таймер в **текущем** процессе (из каталога `Arcade/`)
 
-3. Перезагрузите Batocera или запустите сервис:
+Для постоянной работы после первого запуска лучше поднять сервис (он использует уже развёрнутый `/userdata/system/scripts/main.py`):
 
 ```bash
-/userdata/system/services/main start
-/userdata/system/services/main status
+batocera-services restart main
+batocera-services status main
 ```
 
-Лог сервиса: `/userdata/system/logs/main-service.log`
+Повторный `python3 scripts/main.py` из `Arcade/` **не обновит** файлы в `/userdata/system/` — для обновлений используйте способ 2.
 
-## Команды main.py
+### Способ 2: явный deploy (обновления и повторная установка)
+
+Принудительно перезаписывает файлы в `/userdata/system/`, даже если deploy уже выполнялся.
+
+**Через скрипт** (рекомендуется):
 
 ```bash
-python3 scripts/main.py              # deploy (если нужно) + запуск
-python3 scripts/main.py deploy       # принудительное обновление файлов на Batocera
-python3 scripts/main.py vendor-wheels   # скачать wheels (нужен интернет и pip)
+cd /userdata/system/Arcade
+./deploy.sh              # только deploy
+./deploy.sh --restart    # deploy + перезапуск сервиса
 ```
 
-### Повторный deploy
+**Через main.py** (то же самое, без перезапуска сервиса):
 
 ```bash
+cd /userdata/system/Arcade
 python3 scripts/main.py deploy
+batocera-services restart main
 ```
 
-Или удалите маркер и перезапустите:
+Альтернатива для повторного авто-deploy без `deploy`: удалить маркер и снова запустить `main.py`:
 
 ```bash
 rm /userdata/system/.arcade-deployed
 python3 scripts/main.py
 ```
 
+### Сравнение способов
+
+| Команда | Deploy | Запуск таймера | Когда использовать |
+|---------|--------|----------------|-------------------|
+| `python3 scripts/main.py` | только первый раз | да | первая установка |
+| `python3 scripts/main.py deploy` | всегда | нет | обновление файлов |
+| `./deploy.sh` | всегда | нет | обновление файлов |
+| `./deploy.sh --restart` | всегда | через сервис | обновление + перезапуск |
+| `batocera-services restart main` | нет | через сервис | обычный перезапуск |
+
+### Автозапуск при загрузке
+
+В `batocera.conf` проекта указано `system.services=main` — после deploy оно попадает в `/userdata/system/batocera.conf`. Перезагрузите консоль:
+
+```bash
+reboot
+```
+
+Или включите сервис вручную: `batocera-services enable main`
+
+### Логи и проверка
+
+```bash
+batocera-services status main
+```
+
+| Лог | Путь |
+|-----|------|
+| Сервис (stdout/stderr) | `/userdata/system/logs/main-service.log` |
+| Приложение | `/userdata/system/scripts/logs.log` |
+
+В логе должны быть строки `MAIN service STARTED` и `'server.py' started`. Веб-интерфейс: `http://<IP-консоли>:5000/`
+
+## Команды main.py
+
+```bash
+python3 scripts/main.py              # авто-deploy (если первый раз) + запуск
+python3 scripts/main.py deploy       # принудительный deploy
+python3 scripts/main.py vendor-wheels   # скачать wheels (нужен интернет и pip)
+```
+
 ## Конфигурация
 
-Файл `config_timer.toml` в корне репозитория (после deploy — в `/userdata/system/scripts/`).
+Файл `scripts/config_main.toml` (после deploy — `/userdata/system/scripts/config_main.toml`).
 
 ```toml
+[server]
+port = 5000
+
 [timer]
 time_step = 5      # шаг «+», минуты
 time_wait = 60     # пауза после окончания, секунды
@@ -150,6 +209,8 @@ test_on_start = true
 ```
 
 ## Аппаратура
+
+![Распиновка GPIO (BCM)](pins.png)
 
 - **Raspberry Pi 5** с Batocera
 - Реле автомата (GPIO 17, 27, 22)
