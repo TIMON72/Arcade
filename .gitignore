@@ -3,3 +3,4 @@ venv
 logs.log
 __pycache__
 .lgd-nfy0
+__init__.py

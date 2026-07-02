@@ -112,14 +112,15 @@ def server_start_async(queue_main=None, host="0.0.0.0", port=5000):
     signal.signal(signal.SIGTERM, signal_handler)
     signal.signal(signal.SIGINT, signal_handler)
     
+    loop = None
     try:
         # Создаём new event loop для безопасности в multiprocessing
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        
+
         # Запускаем сервер
         loop.run_until_complete(server_start(queue_main, host, port))
-        
+
     except KeyboardInterrupt:
         print("\nWEB_SERVER IS STOPPED (KeyboardInterrupt)")
     except asyncio.CancelledError:
@@ -127,9 +128,10 @@ def server_start_async(queue_main=None, host="0.0.0.0", port=5000):
     except Exception as ex:
         print(f"WEB_SERVER ERROR: {ex}")
     finally:
-        print("Closing event loop...")
-        loop.close()
-        print("WEB_SERVER: All resources released")
+        if loop is not None:
+            print("Closing event loop...")
+            loop.close()
+            print("WEB_SERVER: All resources released")
 
 
 if __name__ == "__main__":

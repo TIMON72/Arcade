@@ -1,9 +1,15 @@
+import os
 import queue
 import lgpio
 import sys
 import time
 from datetime import datetime
 
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if _SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPT_DIR)
+
+import main as app_main
 
 # Класс кнопки
 class Button:
@@ -30,13 +36,15 @@ class Button:
         return False
 
 
-# Константы (PIN)
-RF_INCREASE = 5 # Кнопка "+"
-RF_PLAYPAUSE = 6 # Кнопка "Play/Pause"
-RF_STOP = 13 # Кнопка "Stop"
-R_BUTTONS = 17 # Реле IN1-IN6
-R_PLAYPAUSE = 27 # Реле IN7
-R_STOP = 22 # Реле IN8
+# Пины GPIO и реле — из config.toml [gpio]
+_gpio_cfg = app_main.gpio_config
+
+RF_INCREASE = _gpio_cfg.rf_increase
+RF_PLAYPAUSE = _gpio_cfg.rf_playpause
+RF_STOP = _gpio_cfg.rf_stop
+R_BUTTONS = _gpio_cfg.r_buttons
+R_PLAYPAUSE = _gpio_cfg.r_playpause
+R_STOP = _gpio_cfg.r_stop
 
 # Группы пинов (для гибкой инициализации/логирования)
 OUTPUT_PINS = {
@@ -56,17 +64,17 @@ RF_TO_RELAY = {
 }
 
 # Глобальные переменные - инициализируются в setup()
-h = None
-b_increase = None
-b_playpause = None
-b_stop = None
+h: int | None = None
+b_increase: Button | None = None
+b_playpause: Button | None = None
+b_stop: Button | None = None
 
 # Флаги для отслеживания каких контактов удалось выделить
 gpio_pins_available = {name: False for name in {**OUTPUT_PINS, **INPUT_PINS}}
 
 # Режим активации реле
-isRelayLow = True # Флаг: тип активации реле = low level
-isRelayHigh = not isRelayLow # Флаг: тип активации реле = high level
+isRelayLow = _gpio_cfg.relay_active_low
+isRelayHigh = not isRelayLow
 # Состояния автомата (для ADD с сервера и логов)
 state_starting = True
 state_playing = False
@@ -79,11 +87,13 @@ hours = 0
 minutes = 0
 seconds = 0
 time_main = [0, 0, 0]
-time_step = 5
+time_step = app_main.timer_config.time_step
 time_max = 24
-time_start = 5
-time_wait = 60
+time_start = time_step
+time_wait = app_main.timer_config.time_wait
+time_reset = app_main.timer_config.time_reset
 
+_matrix_ready = False
 # Однократное предупреждение о неподключенном реле
 relay_disconnected_warned = False
 _last_logged_state = None
@@ -110,8 +120,111 @@ class TickTimer:
     def refresh(self):
         self._previous = time.monotonic()
 
+    def isReset(self, minutes):
+        return (time.monotonic() - self._previous) >= minutes * 60
+
 
 tick_timer = TickTimer()
+
+
+def setup_matrix_display():
+    global _matrix_ready
+    matrix_cfg = app_main.matrix_config
+    if not matrix_cfg.enabled:
+        print("Matrix: disabled in config")
+        return
+    try:
+        from modules import matrix
+
+        matrix.setup_matrix(
+            cascaded=matrix_cfg.cascaded,
+            block_orientation=matrix_cfg.block_orientation,
+            rotate=matrix_cfg.rotate,
+            brightness=matrix_cfg.brightness,
+            spi_port=matrix_cfg.spi_port,
+            spi_device=matrix_cfg.spi_device,
+            din=matrix_cfg.din,
+            clk=matrix_cfg.clk,
+            cs=matrix_cfg.cs,
+            interface=matrix_cfg.interface,
+            blocks_reverse=matrix_cfg.blocks_reverse,
+        )
+        if matrix_cfg.test_on_start:
+            matrix.run_self_test()
+        matrix.start_scrolling_text(matrix_cfg.text_display, speed=matrix_cfg.scroll_speed)
+        _matrix_ready = True
+        driver = matrix_cfg.interface
+        print(
+            f"Matrix: MAX7219 initialized ({driver}, "
+            f"DIN/CLK/CS={matrix_cfg.din}/{matrix_cfg.clk}/{matrix_cfg.cs}, "
+            f"cascaded={matrix_cfg.cascaded})"
+        )
+    except Exception as error:
+        _matrix_ready = False
+        print(f"WARNING: Matrix init failed: {error}")
+
+
+def matrix_show_time():
+    if not _matrix_ready:
+        return
+    from modules import matrix
+
+    matrix.print_time(hours, minutes, seconds)
+
+
+def matrix_show_waiting():
+    if not _matrix_ready:
+        return
+    from modules import matrix
+
+    matrix.print_waiting_time(seconds)
+
+
+def matrix_show_text(label):
+    if not _matrix_ready:
+        return
+    from modules import matrix
+
+    matrix.print_text(label)
+
+
+def matrix_show_start():
+    if _matrix_ready:
+        from modules import matrix
+
+        matrix.print_start(time_start)
+        return
+    _console_start_countdown()
+
+
+def matrix_resume_scroll():
+    if not _matrix_ready:
+        return
+    from modules import matrix
+
+    matrix_cfg = app_main.matrix_config
+    matrix.start_scrolling_text(matrix_cfg.text_display, speed=matrix_cfg.scroll_speed)
+
+
+def matrix_scroll_tick():
+    if not _matrix_ready:
+        return
+    from modules import matrix
+
+    matrix.scroll_tick()
+
+
+def update_matrix_idle():
+    if not _matrix_ready or activated:
+        return
+    if (
+        hours == time_main[0]
+        and minutes == time_main[1]
+        and seconds == time_main[2]
+    ):
+        matrix_scroll_tick()
+    elif tick_timer.isReset(time_reset):
+        handle_stop("timer")
 
 
 def finish_timer_line():
@@ -193,7 +306,7 @@ def log_time():
     print(f"TIME: {hours:02d}:{minutes:02d}:{seconds:02d}")
 
 
-def print_start_countdown():
+def _console_start_countdown():
     finish_timer_line()
     for counter in range(time_start, 0, -1):
         sys.stdout.write(f"\rCOUNTDOWN: {counter}\033[K")
@@ -212,6 +325,8 @@ def handle_increase(source="radio"):
         if minutes > 59:
             hours += 1
             minutes = minutes % 60
+    matrix_show_time()
+    tick_timer.refresh()
     log_time()
 
 
@@ -222,7 +337,7 @@ def handle_playpause(source="radio"):
         if is_timer_empty():
             print("BTN: PLAYPAUSE ignored: timer not set (00:00:00)")
             return
-        print_start_countdown()
+        matrix_show_start()
         print(f"RELAY: R_PLAYPAUSE({R_PLAYPAUSE}) click")
         relay_click(R_PLAYPAUSE)
         print(f"RELAY: R_BUTTONS({R_BUTTONS}) activate")
@@ -238,11 +353,13 @@ def handle_playpause(source="radio"):
         relay_click(R_PLAYPAUSE)
         print(f"RELAY: R_BUTTONS({R_BUTTONS}) deactivate")
         relay_deactivate(R_BUTTONS)
+        matrix_show_text("ПАУЗА")
         print("STATE: PAUSE")
         activated = False
         sync_state_flags()
+        tick_timer.refresh()
     elif not activated and not waited:
-        print_start_countdown()
+        matrix_show_start()
         print(f"RELAY: R_PLAYPAUSE({R_PLAYPAUSE}) click")
         relay_click(R_PLAYPAUSE)
         print(f"RELAY: R_BUTTONS({R_BUTTONS}) activate")
@@ -257,6 +374,7 @@ def handle_playpause(source="radio"):
         relay_deactivate(R_BUTTONS)
         activated = True
         seconds = time_wait
+        matrix_show_waiting()
         sync_state_flags()
         log_timer_state("waiting")
         tick_timer.refresh()
@@ -267,9 +385,11 @@ def handle_playpause(source="radio"):
         hours = time_main[0]
         minutes = time_main[1] + time_step
         seconds = time_main[2]
+        matrix_show_time()
         log_time()
         sync_state_flags()
         log_ready()
+        matrix_resume_scroll()
 
 
 def handle_stop(source="radio"):
@@ -279,15 +399,22 @@ def handle_stop(source="radio"):
     relay_click(R_STOP)
     print(f"RELAY: R_BUTTONS({R_BUTTONS}) deactivate")
     relay_deactivate(R_BUTTONS)
+    matrix_show_text("КОНЕЦ")
     start = False
     activated = False
     waited = False
     hours = time_main[0]
     minutes = time_main[1]
     seconds = time_main[2]
+    if _matrix_ready:
+        from modules import matrix
+
+        time.sleep(5)
+        matrix.clear()
     log_time()
     sync_state_flags()
     log_ready()
+    matrix_resume_scroll()
 
 
 def relay_activate(relay: int):
@@ -321,6 +448,7 @@ def _on_countdown_finished():
         relay_deactivate(R_BUTTONS)
         activated = True
         seconds = time_wait
+        matrix_show_waiting()
         sync_state_flags()
         log_timer_state("waiting")
         tick_timer.refresh()
@@ -330,28 +458,29 @@ def _on_countdown_finished():
 
 
 def tick(delay_ms=1000):
-    global hours, minutes, seconds, activated, waited, start
-    if not start:
+    global hours, minutes, seconds, activated, waited
+    if not activated:
         return
     if not tick_timer.isTicked(delay_ms):
         return
-    if activated:
-        show_timer_inline()
-        seconds -= 1
-        if seconds < 0:
-            seconds = 59
-            minutes -= 1
-            if minutes < 0:
-                minutes = 59
-                hours -= 1
-                if hours < 0:
-                    hours = 0
-                    minutes = 0
-                    seconds = 0
-        if seconds == 0 and minutes == 0 and hours == 0:
-            _on_countdown_finished()
+    if waited:
+        matrix_show_waiting()
     else:
-        show_timer_inline()
+        matrix_show_time()
+    show_timer_inline()
+    seconds -= 1
+    if seconds < 0:
+        seconds = 59
+        minutes -= 1
+        if minutes < 0:
+            minutes = 59
+            hours -= 1
+            if hours < 0:
+                hours = 0
+                minutes = 0
+                seconds = 0
+    if seconds == 0 and minutes == 0 and hours == 0:
+        _on_countdown_finished()
 
 
 def gpio_inputs_ready():
@@ -396,9 +525,16 @@ def setup():
     global h, b_increase, b_playpause, b_stop, gpio_pins_available
     if h is not None and any(gpio_pins_available.values()):
         return
-    import main as app_main
     app_main.cleanup_stale_project_processes(log=print)
     print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - Timer started")
+    print(f"Config: time_step={time_step} min, time_wait={time_wait} sec, time_reset={time_reset} min")
+    print(
+        "GPIO: "
+        f"RF_INCREASE={RF_INCREASE}, RF_PLAYPAUSE={RF_PLAYPAUSE}, RF_STOP={RF_STOP}, "
+        f"R_BUTTONS={R_BUTTONS}, R_PLAYPAUSE={R_PLAYPAUSE}, R_STOP={R_STOP}, "
+        f"relay_active_low={isRelayLow}"
+    )
+    setup_matrix_display()
     try:
         gpiochip = None
         for i in range(10):
@@ -457,7 +593,12 @@ def loop(queue_main = None):
     try:
         while True:
             updateState()
-            if gpio_inputs_ready():
+            if (
+                gpio_inputs_ready()
+                and b_increase is not None
+                and b_playpause is not None
+                and b_stop is not None
+            ):
                 if b_increase.isClicked():
                     log_button(RF_PIN_NAMES[RF_INCREASE])
                     action(RF_INCREASE)
@@ -476,6 +617,7 @@ def loop(queue_main = None):
                     action(signal)
             except queue.Empty:
                 pass
+            update_matrix_idle()
             tick(1000)
             time.sleep(0.1)
     finally:

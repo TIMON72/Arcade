@@ -7,6 +7,8 @@ import multiprocessing
 import time
 import logging
 import signal
+import tomllib
+from dataclasses import dataclass
 
 # ============================================================================
 # ВИРТУАЛЬНАЯ СРЕДА - Инициализация
@@ -86,6 +88,212 @@ if __name__ == "__main__":
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
 LOG_FILE = os.path.join(PROJECT_ROOT, "logs.log")
+CONFIG_PATH = os.path.join(PROJECT_ROOT, "config.toml")
+
+
+@dataclass(frozen=True)
+class TimerConfig:
+    time_step: int = 5
+    time_wait: int = 60
+    time_reset: int = 5
+
+
+@dataclass(frozen=True)
+class GpioConfig:
+    rf_increase: int = 5
+    rf_playpause: int = 6
+    rf_stop: int = 13
+    r_buttons: int = 17
+    r_playpause: int = 27
+    r_stop: int = 22
+    relay_active_low: bool = True
+
+
+@dataclass(frozen=True)
+class MatrixConfig:
+    enabled: bool = True
+    brightness: int = 7
+    scroll_speed: int = 7
+    text_display: str = "АРЕНДА: т. +79233549295"
+    spi_port: int = 10
+    spi_device: int = 0
+    din: int = 10
+    clk: int = 11
+    cs: int = 8
+    cascaded: int = 4
+    block_orientation: int = 90
+    rotate: int = 2
+    blocks_reverse: bool = True
+    test_on_start: bool = True
+    interface: str = "bitbang"
+
+
+def _read_positive_int(section: dict, key: str, default: int) -> int:
+    if key not in section:
+        return default
+    value = section[key]
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{key} must be an integer")
+    if value <= 0:
+        raise ValueError(f"{key} must be greater than 0")
+    return value
+
+
+def _read_string(section: dict, key: str, default: str) -> str:
+    if key not in section:
+        return default
+    value = section[key]
+    if not isinstance(value, str):
+        raise ValueError(f"{key} must be a string")
+    return value
+
+
+def _read_bool(section: dict, key: str, default: bool) -> bool:
+    if key not in section:
+        return default
+    value = section[key]
+    if not isinstance(value, bool):
+        raise ValueError(f"{key} must be a boolean")
+    return value
+
+
+def _read_brightness(section: dict, key: str, default: int) -> int:
+    if key not in section:
+        return default
+    value = section[key]
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{key} must be an integer")
+    if value < 0 or value > 15:
+        raise ValueError(f"{key} must be between 0 and 15")
+    return value
+
+
+def _read_bcm_pin(section: dict, key: str, default: int) -> int:
+    if key not in section:
+        return default
+    value = section[key]
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{key} must be an integer")
+    if value < 0 or value > 53:
+        raise ValueError(f"{key} must be a BCM pin number between 0 and 53")
+    return value
+
+
+def _read_non_negative_int(section: dict, key: str, default: int) -> int:
+    if key not in section:
+        return default
+    value = section[key]
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{key} must be an integer")
+    if value < 0:
+        raise ValueError(f"{key} must be greater than or equal to 0")
+    return value
+
+
+def _read_block_orientation(section: dict, key: str, default: int) -> int:
+    if key not in section:
+        return default
+    value = section[key]
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{key} must be an integer")
+    if value not in (0, 90, -90, 180):
+        raise ValueError(f"{key} must be one of 0, 90, -90, 180")
+    return value
+
+
+def _read_rotate(section: dict, key: str, default: int) -> int:
+    if key not in section:
+        return default
+    value = section[key]
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{key} must be an integer")
+    if value not in (0, 1, 2, 3):
+        raise ValueError(f"{key} must be 0, 1, 2, or 3 (x90°)")
+    return value
+
+
+def load_gpio_config() -> GpioConfig:
+    defaults = GpioConfig()
+    if not os.path.isfile(CONFIG_PATH):
+        return defaults
+
+    with open(CONFIG_PATH, "rb") as config_file:
+        data = tomllib.load(config_file)
+
+    gpio_section = data.get("gpio", {})
+    if not isinstance(gpio_section, dict):
+        raise ValueError("[gpio] section must be a table")
+
+    return GpioConfig(
+        rf_increase=_read_bcm_pin(gpio_section, "rf_increase", defaults.rf_increase),
+        rf_playpause=_read_bcm_pin(gpio_section, "rf_playpause", defaults.rf_playpause),
+        rf_stop=_read_bcm_pin(gpio_section, "rf_stop", defaults.rf_stop),
+        r_buttons=_read_bcm_pin(gpio_section, "r_buttons", defaults.r_buttons),
+        r_playpause=_read_bcm_pin(gpio_section, "r_playpause", defaults.r_playpause),
+        r_stop=_read_bcm_pin(gpio_section, "r_stop", defaults.r_stop),
+        relay_active_low=_read_bool(gpio_section, "relay_active_low", defaults.relay_active_low),
+    )
+
+
+def load_timer_config() -> TimerConfig:
+    defaults = TimerConfig()
+    if not os.path.isfile(CONFIG_PATH):
+        return defaults
+
+    with open(CONFIG_PATH, "rb") as config_file:
+        data = tomllib.load(config_file)
+
+    timer_section = data.get("timer", {})
+    if not isinstance(timer_section, dict):
+        raise ValueError("[timer] section must be a table")
+
+    return TimerConfig(
+        time_step=_read_positive_int(timer_section, "time_step", defaults.time_step),
+        time_wait=_read_positive_int(timer_section, "time_wait", defaults.time_wait),
+        time_reset=_read_positive_int(timer_section, "time_reset", defaults.time_reset),
+    )
+
+
+def load_matrix_config() -> MatrixConfig:
+    defaults = MatrixConfig()
+    if not os.path.isfile(CONFIG_PATH):
+        return defaults
+
+    with open(CONFIG_PATH, "rb") as config_file:
+        data = tomllib.load(config_file)
+
+    matrix_section = data.get("matrix", {})
+    if not isinstance(matrix_section, dict):
+        raise ValueError("[matrix] section must be a table")
+
+    return MatrixConfig(
+        enabled=_read_bool(matrix_section, "enabled", defaults.enabled),
+        brightness=_read_brightness(matrix_section, "brightness", defaults.brightness),
+        scroll_speed=_read_positive_int(matrix_section, "scroll_speed", defaults.scroll_speed),
+        text_display=_read_string(matrix_section, "text_display", defaults.text_display),
+        spi_port=_read_non_negative_int(matrix_section, "spi_port", defaults.spi_port),
+        spi_device=_read_non_negative_int(matrix_section, "spi_device", defaults.spi_device),
+        din=_read_bcm_pin(matrix_section, "din", defaults.din),
+        clk=_read_bcm_pin(matrix_section, "clk", defaults.clk),
+        cs=_read_bcm_pin(matrix_section, "cs", defaults.cs),
+        cascaded=_read_positive_int(matrix_section, "cascaded", defaults.cascaded),
+        block_orientation=_read_block_orientation(
+            matrix_section, "block_orientation", defaults.block_orientation
+        ),
+        rotate=_read_rotate(matrix_section, "rotate", defaults.rotate),
+        blocks_reverse=_read_bool(matrix_section, "blocks_reverse", defaults.blocks_reverse),
+        test_on_start=_read_bool(matrix_section, "test_on_start", defaults.test_on_start),
+        interface=_read_string(matrix_section, "interface", defaults.interface),
+    )
+
+
+try:
+    timer_config = load_timer_config()
+    gpio_config = load_gpio_config()
+    matrix_config = load_matrix_config()
+except (tomllib.TOMLDecodeError, ValueError, OSError) as error:
+    print(f"ERROR: Failed to load config from {CONFIG_PATH}: {error}", file=sys.stderr)
+    sys.exit(1)
 
 
 def _is_debugpy_process(args_text):
@@ -267,6 +475,33 @@ def main():
     signal.signal(signal.SIGINT, signal_handler)
     
     logging.info("MAIN service STARTED")
+    logging.info(
+        "Timer config: time_step=%d min, time_wait=%d sec, time_reset=%d min",
+        timer_config.time_step,
+        timer_config.time_wait,
+        timer_config.time_reset,
+    )
+    logging.info(
+        "GPIO config: inputs +/play/stop=%d/%d/%d relays buttons/play/stop=%d/%d/%d active_low=%s",
+        gpio_config.rf_increase,
+        gpio_config.rf_playpause,
+        gpio_config.rf_stop,
+        gpio_config.r_buttons,
+        gpio_config.r_playpause,
+        gpio_config.r_stop,
+        gpio_config.relay_active_low,
+    )
+    logging.info(
+        "Matrix config: enabled=%s brightness=%d spi=%d:%d din/clk/cs=%d/%d/%d cascaded=%d",
+        matrix_config.enabled,
+        matrix_config.brightness,
+        matrix_config.spi_port,
+        matrix_config.spi_device,
+        matrix_config.din,
+        matrix_config.clk,
+        matrix_config.cs,
+        matrix_config.cascaded,
+    )
 
     cleanup_stale_project_processes(log=logging.info)
 

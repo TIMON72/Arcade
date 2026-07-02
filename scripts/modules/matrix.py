@@ -9,38 +9,71 @@
   matrix_run.tick()   -> scroll_tick()
 """
 
+import sys
+
+
+def _ensure_spidev():
+    try:
+        import spidev  # noqa: F401
+    except ImportError:
+        from modules import spidev_compat
+
+        sys.modules["spidev"] = spidev_compat
+
+
+_ensure_spidev()
+
+import os
 import time
 
 from PIL import Image
 
-from luma.core.interface.serial import noop, spi
-from luma.core.legacy import show_message, text
+from luma.core.interface.serial import bitbang, noop, spi
+from luma.core.legacy import text
 from luma.core.legacy.font import CP437_FONT, proportional
 from luma.core.render import canvas
-from luma.core.virtual import viewport
 from luma.led_matrix.device import max7219
 
-# Пины SPI (BCM) — физ. пины 19, 23, 24
+# Пины SPI по умолчанию (BCM) — физ. пины 19, 23, 24 на Pi 4
 MATRIX_DIN = 10   # MOSI
 MATRIX_CLK = 11   # SCLK
 MATRIX_CS = 8     # CE0
 
 # Как в Arduino: MAX7219<4, 1, CS, DIO, CLK>
 CASCADED_MODULES = 4
-BLOCK_ORIENTATION = 0
-ROTATE = 0
+BLOCK_ORIENTATION = 90
+ROTATE = 2
+SPI_PORT = 10
+SPI_DEVICE = 0
 
 _device = None
 _framebuffer = None
 _scroll_runner = None
 
 
+def _build_scroll_backing(message: str) -> tuple[Image.Image, int]:
+    """Буфер бегущей строки — bitmap font5x8 из GyverGFX (как RunningGFX)."""
+    if _device is None:
+        raise RuntimeError("Matrix device is not initialized")
+    from modules.matrix_font5x8 import draw_message, message_width
+
+    gap = _device.width
+    text_width = message_width(message)
+    total_width = gap + text_width + gap
+    backing = Image.new("1", (total_width, _device.height), 0)
+    draw_message(backing, gap, message)
+    # Текст въезжает с правого края (пустой экран), уезжает влево, затем пауза.
+    max_scroll = gap + text_width
+    return backing, max_scroll
+
+
 class _ScrollRunner:
-    """Неблокирующая бегущая строка (аналог RunningGFX)."""
+    """Неблокирующая бегущая строка (bitmap font5x8, кириллица)."""
 
     def __init__(self):
-        self.virtual = None
-        self.offset = 0
+        self.backing: Image.Image | None = None
+        self.scroll_x = 0
+        self.max_scroll = 0
         self.active = False
         self.last_tick = 0.0
         self.delay_s = 0.05
@@ -48,30 +81,36 @@ class _ScrollRunner:
     def start(self, message, speed=7):
         if _device is None:
             return
-        text_width = max(_device.width, len(message) * 6 + _device.width)
-        self.virtual = viewport(_device, width=text_width, height=_device.height)
-        with canvas(self.virtual) as draw:
-            text(draw, (0, 0), message, fill="white", font=proportional(CP437_FONT))
-        self.offset = -_device.width
+        self.backing, self.max_scroll = _build_scroll_backing(message)
+        self.scroll_x = 0
         self.active = True
         self.last_tick = 0.0
         self.delay_s = max(0.01, 0.12 - speed * 0.007)
+        self._display_frame()
+
+    def _display_frame(self):
+        if _device is None or self.backing is None:
+            return
+        left = self.scroll_x
+        right = left + _device.width
+        frame = self.backing.crop((left, 0, right, _device.height))
+        _device.display(frame)
 
     def tick(self):
-        if not self.active or self.virtual is None or _device is None:
+        if not self.active or self.backing is None or _device is None:
             return
         now = time.time()
         if self.last_tick and (now - self.last_tick) < self.delay_s:
             return
         self.last_tick = now
-        self.offset += 1
-        if self.offset > self.virtual.width:
-            self.offset = -_device.width
-        self.virtual.set_position((self.offset, 0))
+        self.scroll_x += 1
+        if self.scroll_x > self.max_scroll:
+            self.scroll_x = 0
+        self._display_frame()
 
     def stop(self):
         self.active = False
-        self.virtual = None
+        self.backing = None
 
 
 def setup_matrix(
@@ -79,20 +118,59 @@ def setup_matrix(
     block_orientation=BLOCK_ORIENTATION,
     rotate=ROTATE,
     brightness=7,
+    spi_port=SPI_PORT,
+    spi_device=SPI_DEVICE,
+    din=MATRIX_DIN,
+    clk=MATRIX_CLK,
+    cs=MATRIX_CS,
+    interface="bitbang",
+    blocks_reverse=False,
 ):
     """Инициализация матрицы (аналог matrix.begin() + setBright())."""
-    global _device, _framebuffer, _scroll_runner
-    serial = spi(port=0, device=0, gpio=noop())
+    global _device, _framebuffer, _scroll_runner, MATRIX_DIN, MATRIX_CLK, MATRIX_CS
+    MATRIX_DIN, MATRIX_CLK, MATRIX_CS = din, clk, cs
+
+    if interface == "bitbang":
+        from modules.lgpio_gpio import LgpioGPIO
+
+        serial = bitbang(gpio=LgpioGPIO(), SCLK=clk, SDA=din, CE=cs)
+        print(f"Matrix: bitbang SPI on DIN={din} CLK={clk} CS={cs}")
+    else:
+        serial = spi(port=spi_port, device=spi_device, gpio=noop())
+        print(f"Matrix: hardware SPI /dev/spidev{spi_port}.{spi_device}")
+
     _device = max7219(
         serial,
         cascaded=cascaded,
         block_orientation=block_orientation,
         rotate=rotate,
+        blocks_arranged_in_reverse_order=blocks_reverse,
     )
+    print(f"Matrix: display {cascaded * 8}x8, orientation={block_orientation}, reverse={blocks_reverse}")
     _framebuffer = None
     _scroll_runner = _ScrollRunner()
     set_brightness(brightness)
     return _device
+
+
+def run_self_test(hold_s=1.5) -> bool:
+    """Кратко зажигает все LED — проверка SPI и MAX7219."""
+    if _device is None:
+        return False
+    try:
+        stop_scrolling()
+        set_brightness(15)
+        on = Image.new("1", _device.size, 255)
+        off = Image.new("1", _device.size, 0)
+        _device.display(on)
+        time.sleep(hold_s)
+        _device.display(off)
+        time.sleep(0.2)
+        print(f"Matrix: self-test sent ({_device.width}x{_device.height}, all pixels ON)")
+        return True
+    except Exception as error:
+        print(f"Matrix: self-test failed: {error}")
+        return False
 
 
 def is_ready():
@@ -155,20 +233,15 @@ def dot(x, y, on=True):
 
 
 def show_scrolling_text(message, speed=7):
-    """
-    Бегущая строка (аналог RunningGFX).
-    speed: 1–15, чем больше — тем быстрее (как setSpeed в Arduino).
-    """
+    """Блокирующая бегущая строка (bitmap font5x8)."""
     if _device is None:
         return
-    scroll_delay = max(0.01, 0.12 - speed * 0.007)
-    show_message(
-        _device,
-        message,
-        fill="white",
-        font=proportional(CP437_FONT),
-        scroll_delay=scroll_delay,
-    )
+    delay_s = max(0.01, 0.12 - speed * 0.007)
+    backing, max_scroll = _build_scroll_backing(message)
+    for scroll_x in range(max_scroll + 1):
+        frame = backing.crop((scroll_x, 0, scroll_x + _device.width, _device.height))
+        _device.display(frame)
+        time.sleep(delay_s)
 
 
 def show_static_text(message):
