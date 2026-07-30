@@ -1,1 +1,12 @@
+# Нормализуем текст в LF (важно для SSH с Windows-клиента Cursor)
+* text=auto eol=lf
 services/main text eol=lf
+
+# Бинарники / vendor не трогаем
+*.png binary
+*.jpg binary
+*.bin binary
+*.whl binary
+*.vsix binary
+*.tar.xz binary
+*.lrtl binary

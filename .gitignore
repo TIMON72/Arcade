@@ -4,3 +4,11 @@ logs.log
 __pycache__
 .lgd-nfy0
 __init__.py
+
+# Batocera runtime / local noise (не коммитить)
+configs/**/es_log*.txt
+configs/emulationstation/tmp/
+configs/**/cookies.txt
+configs/pulse/cookie
+configs/retroarch/playlists/
+*.lrtl
