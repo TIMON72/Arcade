@@ -4,10 +4,25 @@ ROOT="/userdata/system/scripts"
 SCRIPT="$ROOT/main.py"
 PIDFILE="/var/run/main-service.pid"
 LOG="/userdata/system/logs/main-service.log"
-PYTHON="$ROOT/venv/bin/python"
+PYTHON="$ROOT/.venv/bin/python"
+[ -x "$PYTHON" ] || PYTHON="$ROOT/venv/bin/python"
 [ -x "$PYTHON" ] || PYTHON="python3"
 
+GIT_ROOT="/userdata/system/git"
+GIT_LINKS="git git-shell git-receive-pack git-upload-pack git-upload-archive"
+
+# /usr сбрасывается при reboot — восстанавливаем симлинки на портативный git
+ensure_git_links() {
+    [ -x "$GIT_ROOT/bin/git" ] || return 0
+    for cmd in $GIT_LINKS; do
+        if [ -e "$GIT_ROOT/bin/$cmd" ]; then
+            ln -sfn "$GIT_ROOT/bin/$cmd" "/usr/bin/$cmd"
+        fi
+    done
+}
+
 start() {
+    ensure_git_links
     if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
         echo "main is already running (PID $(cat "$PIDFILE"))"
         return 0

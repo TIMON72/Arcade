@@ -3,13 +3,20 @@ import os
 import sys
 import shutil
 import subprocess
-import venv as venv_module
+import importlib
 import multiprocessing
 import time
 import logging
 import signal
+import tempfile
+import platform
+import gzip
 import tomllib
 from dataclasses import dataclass
+from urllib.request import urlretrieve
+
+# stdlib venv: не `import venv` — Pyright путает со каталогом/.venv
+venv_module = importlib.import_module("venv")
 
 # ============================================================================
 # ВИРТУАЛЬНАЯ СРЕДА И РАЗВЁРТЫВАНИЕ НА BATOCERA
@@ -19,6 +26,26 @@ _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _BATOCERA_SYSTEM_DIR = "/userdata/system"
 _DEPLOYED_SCRIPTS_DIR = os.path.join(_BATOCERA_SYSTEM_DIR, "scripts")
 _DEPLOY_MARKER = os.path.join(_BATOCERA_SYSTEM_DIR, ".arcade-deployed")
+_GIT_INSTALL_DIR = os.path.join(_BATOCERA_SYSTEM_DIR, "git")
+_GIT_VENDOR_REL = os.path.join("vendor", "git")
+_GIT_LINK_NAMES = (
+    "git",
+    "git-shell",
+    "git-receive-pack",
+    "git-upload-pack",
+    "git-upload-archive",
+)
+# Портативный musl git (baulk/git-minimal), офлайн как wheels/
+_GIT_RELEASE = "v2.55.0"
+_GIT_TARBALL_BY_ARCH = {
+    "aarch64": f"git-minimal-musl-{_GIT_RELEASE}-linux-aarch64.tar.xz",
+    "arm64": f"git-minimal-musl-{_GIT_RELEASE}-linux-aarch64.tar.xz",
+    "x86_64": f"git-minimal-musl-{_GIT_RELEASE}-linux-amd64.tar.xz",
+    "amd64": f"git-minimal-musl-{_GIT_RELEASE}-linux-amd64.tar.xz",
+}
+_GIT_DOWNLOAD_BASE = (
+    f"https://github.com/baulk/git-minimal/releases/download/{_GIT_RELEASE}"
+)
 
 
 _CONFIG_FILENAME = "config_main.toml"
@@ -54,7 +81,15 @@ def _resolve_wheels_dir() -> str:
 
 
 def _resolve_venv_dir() -> str:
-    return os.path.join(_runtime_scripts_dir(), "venv")
+    """Каталог .venv (не venv) — иначе Pyright путает его со stdlib-модулем venv."""
+    scripts_dir = _runtime_scripts_dir()
+    preferred = os.path.join(scripts_dir, ".venv")
+    legacy = os.path.join(scripts_dir, "venv")
+    if os.path.isdir(preferred):
+        return preferred
+    if os.path.isdir(legacy):
+        return legacy
+    return preferred
 
 
 def _bundle_root() -> str:
@@ -113,7 +148,7 @@ _WHEELS_DIR = _resolve_wheels_dir()
 def _deploy_ignore(dirpath: str, names: list[str]) -> set[str]:
     ignored = set()
     for name in names:
-        if name in {"venv", "__pycache__", ".lgd-nfy0", "wheels"}:
+        if name in {"venv", ".venv", "__pycache__", ".lgd-nfy0", "wheels"}:
             ignored.add(name)
             continue
         full = os.path.join(dirpath, name)
@@ -186,6 +221,9 @@ def deploy_to_batocera(force: bool = False) -> bool:
         _fix_shell_line_endings(service_main)
         os.chmod(service_main, 0o755)
 
+    install_portable_git(source_root)
+    install_cursor_extensions(source_root)
+
     with open(_DEPLOY_MARKER, "w", encoding="utf-8") as marker:
         marker.write(f"{source_root}\n")
 
@@ -194,6 +232,275 @@ def deploy_to_batocera(force: bool = False) -> bool:
     print("  Service: /userdata/system/services/main {start|stop|status}")
     print("=" * 60)
     return True
+
+
+def _host_arch() -> str:
+    return platform.machine().lower()
+
+
+def _git_tarball_name() -> str | None:
+    return _GIT_TARBALL_BY_ARCH.get(_host_arch())
+
+
+def _find_git_tarball(source_root: str) -> str | None:
+    vendor_dir = os.path.join(source_root, _GIT_VENDOR_REL)
+    if not os.path.isdir(vendor_dir):
+        return None
+    preferred = _git_tarball_name()
+    if preferred:
+        path = os.path.join(vendor_dir, preferred)
+        if os.path.isfile(path):
+            return path
+    # запасной поиск по суффиксу архитектуры в имени файла
+    arch = _host_arch()
+    aliases = {
+        "aarch64": ("aarch64", "arm64"),
+        "arm64": ("aarch64", "arm64"),
+        "x86_64": ("amd64", "x86_64"),
+        "amd64": ("amd64", "x86_64"),
+    }.get(arch, (arch,))
+    for name in sorted(os.listdir(vendor_dir)):
+        if not name.endswith(".tar.xz"):
+            continue
+        lower = name.lower()
+        if any(token in lower for token in aliases):
+            return os.path.join(vendor_dir, name)
+    return None
+
+
+def link_portable_git() -> bool:
+    """Симлинки /usr/bin/git* → /userdata/system/git/bin (нужны после reboot без overlay)."""
+    git_bin = os.path.join(_GIT_INSTALL_DIR, "bin", "git")
+    if not os.path.isfile(git_bin) or not os.access(git_bin, os.X_OK):
+        return False
+    for name in _GIT_LINK_NAMES:
+        src = os.path.join(_GIT_INSTALL_DIR, "bin", name)
+        if not os.path.exists(src):
+            continue
+        dst = os.path.join("/usr/bin", name)
+        try:
+            if os.path.islink(dst) or os.path.isfile(dst):
+                os.remove(dst)
+            os.symlink(src, dst)
+        except OSError as error:
+            print(f"⚠ Cannot link {dst}: {error}")
+            return False
+    return True
+
+
+def install_portable_git(source_root: str | None = None) -> bool:
+    """Распаковать vendor/git/*.tar.xz в /userdata/system/git и прописать /usr/bin."""
+    root = source_root or _bundle_root()
+    tarball = _find_git_tarball(root)
+    if tarball is None:
+        print("⚠ vendor/git: no matching tarball for this arch — git not installed")
+        print(f"  expected arch={_host_arch()}, run: python3 scripts/main.py vendor-git")
+        return False
+
+    print(f"Installing portable git from {os.path.basename(tarball)}...")
+    os.makedirs(_BATOCERA_SYSTEM_DIR, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="arcade-git-") as tmp:
+        # На Batocera в Python часто нет модуля lzma — используем системный tar.
+        extract = subprocess.run(
+            ["tar", "-xJf", tarball, "-C", tmp],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if extract.returncode != 0:
+            detail = (extract.stderr or extract.stdout or "").strip()
+            print(f"✗ ERROR: tar extract failed: {detail or extract.returncode}")
+            return False
+        extracted = [
+            os.path.join(tmp, name)
+            for name in os.listdir(tmp)
+            if os.path.isdir(os.path.join(tmp, name))
+        ]
+        if len(extracted) != 1:
+            print("✗ ERROR: unexpected git archive layout")
+            return False
+        if os.path.isdir(_GIT_INSTALL_DIR):
+            shutil.rmtree(_GIT_INSTALL_DIR)
+        shutil.move(extracted[0], _GIT_INSTALL_DIR)
+
+    git_bin = os.path.join(_GIT_INSTALL_DIR, "bin", "git")
+    os.chmod(git_bin, 0o755)
+    if not link_portable_git():
+        print("✗ ERROR: git extracted but /usr/bin links failed")
+        return False
+
+    version = subprocess.run(
+        [git_bin, "--version"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    detail = (version.stdout or version.stderr or "").strip()
+    print(f"✓ Portable git installed: {_GIT_INSTALL_DIR} ({detail or 'ok'})")
+    return True
+
+
+def vendor_git() -> int:
+    """Скачать tarball git в vendor/git/ (нужен интернет; для коммита в репозиторий)."""
+    name = _git_tarball_name()
+    if name is None:
+        print(f"✗ ERROR: unsupported arch for vendor-git: {_host_arch()}")
+        return 1
+    vendor_dir = os.path.join(_bundle_root(), _GIT_VENDOR_REL)
+    os.makedirs(vendor_dir, exist_ok=True)
+    dest = os.path.join(vendor_dir, name)
+    url = f"{_GIT_DOWNLOAD_BASE}/{name}"
+    print(f"Downloading {url}")
+    print(f"  -> {dest}")
+    try:
+        urlretrieve(url, dest)
+    except Exception as error:
+        print(f"✗ ERROR: download failed: {error}")
+        return 1
+    print(f"✓ Saved {os.path.getsize(dest)} bytes")
+    print("  Commit vendor/git/ so deploy works offline on each machine.")
+    return 0
+
+
+_CURSOR_EXTENSIONS = (
+    "ms-python.python",
+    "ms-python.debugpy",
+)
+_CURSOR_VSIX_VENDOR_REL = os.path.join("vendor", "vscode")
+_CURSOR_VSIX_DOWNLOADS = {
+    "ms-python.python": (
+        "https://marketplace.visualstudio.com/_apis/public/gallery/"
+        "publishers/ms-python/vsextensions/python/2025.4.0/vspackage"
+    ),
+    "ms-python.debugpy": (
+        "https://marketplace.visualstudio.com/_apis/public/gallery/"
+        "publishers/ms-python/vsextensions/debugpy/2026.6.0/vspackage"
+    ),
+}
+
+
+def _find_cursor_cli() -> str | None:
+    """CLI remote Cursor: .../cursor-server/bin/<arch>/<hash>/bin/remote-cli/cursor"""
+    candidates = []
+    for base in (
+        "/userdata/system/.cursor-server/bin",
+        os.path.expanduser("~/.cursor-server/bin"),
+    ):
+        if not os.path.isdir(base):
+            continue
+        for arch in sorted(os.listdir(base)):
+            arch_dir = os.path.join(base, arch)
+            if not os.path.isdir(arch_dir):
+                continue
+            for build in sorted(os.listdir(arch_dir), reverse=True):
+                cli = os.path.join(arch_dir, build, "bin", "remote-cli", "cursor")
+                if os.path.isfile(cli) and os.access(cli, os.X_OK):
+                    candidates.append(cli)
+    return candidates[0] if candidates else None
+
+
+def _cursor_extensions_dir() -> str | None:
+    for path in (
+        "/userdata/system/.cursor-server/extensions",
+        os.path.expanduser("~/.cursor-server/extensions"),
+    ):
+        if os.path.isdir(path):
+            return path
+    return None
+
+
+def _cursor_extension_installed(ext_id: str) -> bool:
+    ext_dir = _cursor_extensions_dir()
+    if ext_dir is None:
+        return False
+    prefix = ext_id.lower() + "-"
+    try:
+        return any(name.lower().startswith(prefix) for name in os.listdir(ext_dir))
+    except OSError:
+        return False
+
+
+def _find_extension_vsix(source_root: str, ext_id: str) -> str | None:
+    vendor_dir = os.path.join(source_root, _CURSOR_VSIX_VENDOR_REL)
+    if not os.path.isdir(vendor_dir):
+        return None
+    # Точное имя ms-python.python.vsix или с версией в имени
+    exact = os.path.join(vendor_dir, f"{ext_id}.vsix")
+    if os.path.isfile(exact):
+        return exact
+    prefix = ext_id.lower()
+    for name in sorted(os.listdir(vendor_dir)):
+        lower = name.lower()
+        if lower.startswith(prefix) and lower.endswith(".vsix"):
+            return os.path.join(vendor_dir, name)
+    return None
+
+
+def install_cursor_extensions(source_root: str | None = None) -> bool:
+    """Ставит Python/debugpy в remote Cursor (офлайн из vendor/vscode или marketplace)."""
+    root = source_root or _bundle_root()
+    cli = _find_cursor_cli()
+    if cli is None:
+        print("⚠ Cursor CLI not found — skip IDE extensions (open project via SSH once)")
+        return False
+
+    print("Installing Cursor IDE extensions (Python / debugpy)...")
+    all_ok = True
+    for ext_id in _CURSOR_EXTENSIONS:
+        if _cursor_extension_installed(ext_id):
+            print(f"  ✓ {ext_id} already installed")
+            continue
+        vsix = _find_extension_vsix(root, ext_id)
+        target = vsix if vsix else ext_id
+        label = os.path.basename(vsix) if vsix else ext_id
+        print(f"  Installing {label}...")
+        result = subprocess.run(
+            [cli, "--install-extension", target, "--force"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0 and not _cursor_extension_installed(ext_id):
+            detail = (result.stderr or result.stdout or "").strip()
+            print(f"  ✗ {ext_id}: {detail or result.returncode}")
+            all_ok = False
+        else:
+            print(f"  ✓ {ext_id}")
+    return all_ok
+
+
+def vendor_extensions() -> int:
+    """Скачать VSIX в vendor/vscode/ (нужен интернет; для офлайн-deploy)."""
+    vendor_dir = os.path.join(_bundle_root(), _CURSOR_VSIX_VENDOR_REL)
+    os.makedirs(vendor_dir, exist_ok=True)
+
+    for ext_id, url in _CURSOR_VSIX_DOWNLOADS.items():
+        dest = os.path.join(vendor_dir, f"{ext_id}.vsix")
+        print(f"Downloading {ext_id}...")
+        print(f"  {url}")
+        try:
+            tmp_path, headers = urlretrieve(url)
+        except Exception as error:
+            print(f"✗ ERROR: {error}")
+            return 1
+        try:
+            with open(tmp_path, "rb") as src:
+                data = src.read()
+            encoding = ""
+            if hasattr(headers, "get"):
+                encoding = (headers.get("Content-Encoding") or "").lower()
+            if encoding == "gzip" or data[:2] == b"\x1f\x8b":
+                data = gzip.decompress(data)
+            with open(dest, "wb") as out:
+                out.write(data)
+        finally:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+        print(f"  ✓ {dest} ({os.path.getsize(dest)} bytes)")
+    print("Commit vendor/vscode/ for offline installs on each machine.")
+    return 0
 
 
 def _venv_pip() -> str:
@@ -304,9 +611,20 @@ def vendor_wheels() -> int:
 
 
 def setup_venv():
-    """Создаёт venv и ставит luma (офлайн из wheels/, если есть)."""
+    """Создаёт .venv и ставит luma (офлайн из wheels/, если есть)."""
+    global _VENV_DIR
+    scripts_dir = _runtime_scripts_dir()
+    preferred = os.path.join(scripts_dir, ".venv")
+    legacy = os.path.join(scripts_dir, "venv")
+    # Старый каталог venv ломает анализ import venv в IDE — переименовываем.
+    if os.path.isdir(legacy) and not os.path.isdir(preferred):
+        print(f"Migrating virtualenv: {legacy} -> {preferred}")
+        os.rename(legacy, preferred)
+    _VENV_DIR = _resolve_venv_dir()
+
     venv_python = _venv_python()
     if os.path.isdir(_VENV_DIR) and _deps_installed(venv_python):
+        _link_workspace_venv()
         return _VENV_DIR
 
     if not os.path.isdir(_VENV_DIR):
@@ -324,14 +642,51 @@ def setup_venv():
         if not _install_dependencies():
             sys.exit(1)
 
+    _link_workspace_venv()
     print("=" * 60)
     return _VENV_DIR
+
+
+def _link_workspace_venv() -> None:
+    """Симлинк <repo>/.venv → /userdata/system/scripts/.venv для Cursor/VS Code."""
+    if not _is_batocera_system():
+        return
+    source_root = _deploy_source_root() or (
+        os.path.dirname(_SCRIPT_DIR) if os.path.basename(_SCRIPT_DIR) == "scripts" else None
+    )
+    if not source_root or not os.path.isdir(_VENV_DIR):
+        return
+    # Не линкуем, если правим уже развёрнутый /userdata/system/scripts
+    if os.path.realpath(source_root) == os.path.realpath(_BATOCERA_SYSTEM_DIR):
+        return
+    if os.path.realpath(source_root) == os.path.realpath(_DEPLOYED_SCRIPTS_DIR):
+        return
+    link_path = os.path.join(source_root, ".venv")
+    try:
+        if os.path.islink(link_path) or os.path.isfile(link_path):
+            os.remove(link_path)
+        elif os.path.isdir(link_path) and not os.path.islink(link_path):
+            # Реальный каталог .venv в репо не трогаем
+            return
+        if not os.path.exists(link_path):
+            os.symlink(_VENV_DIR, link_path)
+            print(f"✓ IDE venv link: {link_path} -> {_VENV_DIR}")
+    except OSError as error:
+        print(f"⚠ Cannot link workspace .venv: {error}")
 
 
 # Инициализируем venv на старте
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "vendor-wheels":
         raise SystemExit(vendor_wheels())
+    if len(sys.argv) > 1 and sys.argv[1] == "vendor-git":
+        raise SystemExit(vendor_git())
+    if len(sys.argv) > 1 and sys.argv[1] == "vendor-extensions":
+        raise SystemExit(vendor_extensions())
+    if len(sys.argv) > 1 and sys.argv[1] == "install-git":
+        raise SystemExit(0 if install_portable_git() else 1)
+    if len(sys.argv) > 1 and sys.argv[1] == "install-extensions":
+        raise SystemExit(0 if install_cursor_extensions() else 1)
     if len(sys.argv) > 1 and sys.argv[1] == "deploy":
         ok = deploy_to_batocera(force=True)
         if ok:
