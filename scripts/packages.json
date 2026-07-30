@@ -1,0 +1,8 @@
+[
+  {"id": 1, "minutes": 5, "price": 50, "label": "5 мин"},
+  {"id": 2, "minutes": 10, "price": 90, "label": "10 мин"},
+  {"id": 3, "minutes": 15, "price": 120, "label": "15 мин"},
+  {"id": 4, "minutes": 20, "price": 150, "label": "20 мин"},
+  {"id": 5, "minutes": 30, "price": 200, "label": "30 мин"},
+  {"id": 6, "minutes": 60, "price": 350, "label": "60 мин"}
+]

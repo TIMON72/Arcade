@@ -4,3 +4,5 @@ logs.log
 __pycache__
 .lgd-nfy0
 __init__.py
+session_until.txt
+session_until.tmp

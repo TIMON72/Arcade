@@ -402,6 +402,12 @@ def handle_stop(source="radio"):
     hours = time_main[0]
     minutes = time_main[1]
     seconds = time_main[2]
+    try:
+        import session
+
+        session.clear()
+    except Exception as exc:
+        print(f"WARNING: session.clear on STOP failed: {exc}")
     if _matrix_ready:
         from modules import matrix
 
@@ -448,6 +454,19 @@ def _on_countdown_finished():
         sync_state_flags()
         log_timer_state("waiting")
         tick_timer.refresh()
+        # Open paywall extension UI; clear session so gameStart cannot skip.
+        try:
+            import session
+
+            session.clear()
+        except Exception as exc:
+            print(f"WARNING: session.clear on WAITING failed: {exc}")
+        if _queue_to_ui is not None:
+            try:
+                _queue_to_ui.put({"cmd": "show", "reason": "extend"})
+                print("PAYWALL: show extend")
+            except Exception as exc:
+                print(f"WARNING: paywall extend signal failed: {exc}")
     else:
         activated = False
         handle_stop("timer")
@@ -486,6 +505,7 @@ def gpio_inputs_ready():
 
 
 _gpio_unavailable_warned = False
+_queue_to_ui = None
 
 
 def teardown_gpio():
@@ -581,8 +601,9 @@ def setup():
 
 
 # Главная цикличная функция Raspberry
-def loop(queue_main = None):
-    global _gpio_unavailable_warned
+def loop(queue_main=None, queue_to_ui=None):
+    global _gpio_unavailable_warned, _queue_to_ui
+    _queue_to_ui = queue_to_ui
     setup()
 
     try:
@@ -617,6 +638,7 @@ def loop(queue_main = None):
             time.sleep(0.1)
     finally:
         teardown_gpio()
+        _queue_to_ui = None
 
 
 # Тестирование

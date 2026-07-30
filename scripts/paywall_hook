@@ -1,0 +1,44 @@
+#!/bin/bash
+# Batocera USER_SCRIPTS hook — gate game launch behind Arcade paywall.
+# Args: <event> <system> <emulator> <core> <rom>
+
+EVENT="$1"
+SYSTEM="$2"
+EMULATOR="$3"
+CORE="$4"
+ROM="$5"
+
+PAYWALL_URL="http://127.0.0.1:5000"
+PY="/userdata/system/scripts/venv/bin/python"
+[ -x "$PY" ] || PY="python3"
+
+case "$EVENT" in
+  gameStart)
+    RESULT="$(curl -s -m 620 --get "$PAYWALL_URL/paywall/wait" \
+      --data-urlencode "system=${SYSTEM}" \
+      --data-urlencode "emulator=${EMULATOR}" \
+      --data-urlencode "rom=${ROM}" 2>/dev/null || true)"
+
+    STATUS="$(printf '%s' "$RESULT" | "$PY" -c 'import sys,json
+try: print(json.load(sys.stdin).get("status",""))
+except Exception: print("")')"
+
+    if [ "$STATUS" = "ok" ]; then
+      echo "paywall: ok ($RESULT)"
+      exit 0
+    fi
+
+    echo "paywall: abort ($RESULT)"
+    kill -TERM "$PPID" 2>/dev/null || true
+    sleep 0.3
+    kill -KILL "$PPID" 2>/dev/null || true
+    exit 1
+    ;;
+  gameStop)
+    curl -s -m 2 "$PAYWALL_URL/paywall/game-stop" >/dev/null 2>&1 || true
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac

@@ -186,6 +186,13 @@ def deploy_to_batocera(force: bool = False) -> bool:
         _fix_shell_line_endings(service_main)
         os.chmod(service_main, 0o755)
 
+    # Paywall gameStart/gameStop hook — only executable under scripts/ for USER_SCRIPTS
+    paywall_hook = os.path.join(scripts_dest, "paywall_hook")
+    if os.path.isfile(paywall_hook):
+        _fix_shell_line_endings(paywall_hook)
+        os.chmod(paywall_hook, 0o755)
+        print(f"  paywall_hook -> executable ({paywall_hook})")
+
     with open(_DEPLOY_MARKER, "w", encoding="utf-8") as marker:
         marker.write(f"{source_root}\n")
 
@@ -209,7 +216,7 @@ def _deps_installed(python_path: str | None = None) -> bool:
     if not os.path.isfile(python):
         return False
     result = subprocess.run(
-        [python, "-c", "import luma.led_matrix"],
+        [python, "-c", "import luma.led_matrix; import pygame"],
         capture_output=True,
         check=False,
     )
@@ -239,12 +246,28 @@ def _install_dependencies() -> bool:
         print("✗ ERROR: pip not found in venv")
         return False
 
+    requirements = _requirements_file()
     wheels = (
         [name for name in os.listdir(_WHEELS_DIR) if name.endswith(".whl")]
         if os.path.isdir(_WHEELS_DIR)
         else []
     )
-    if wheels:
+
+    if os.path.isfile(requirements):
+        if wheels:
+            print(f"Installing requirements from {len(wheels)} local wheels (offline)...")
+            cmd = [
+                pip_path,
+                "install",
+                "--no-index",
+                f"--find-links={_WHEELS_DIR}",
+                "-r",
+                requirements,
+            ]
+        else:
+            print(f"⚠ wheels/ not found — trying pip over the network ({requirements})...")
+            cmd = [pip_path, "install", "-r", requirements]
+    elif wheels:
         print(f"Installing {_LUMA_PACKAGE} from {len(wheels)} local wheels (offline)...")
         cmd = [
             pip_path,
@@ -252,10 +275,11 @@ def _install_dependencies() -> bool:
             "--no-index",
             f"--find-links={_WHEELS_DIR}",
             _LUMA_PACKAGE,
+            "pygame",
         ]
     else:
-        print(f"⚠ wheels/ not found — trying pip over the network ({_LUMA_PACKAGE})...")
-        cmd = [pip_path, "install", _LUMA_PACKAGE]
+        print(f"⚠ wheels/ not found — trying pip over the network ({_LUMA_PACKAGE}+pygame)...")
+        cmd = [pip_path, "install", _LUMA_PACKAGE, "pygame"]
 
     result = subprocess.run(cmd)
     if result.returncode == 0:
@@ -700,36 +724,41 @@ def cleanup_stale_project_processes(current_pid=None, log=None):
         log("Failed to cleanup stale project processes: %s", exc)
 
 
-def cleanup_processes(server_process, timer_process, timeout=5):
-    """Gracefully terminate all child processes"""
-    processes = [
-        ("Server", server_process),
-        ("Timer", timer_process)
-    ]
-    
-    # Сначала отправляем SIGTERM
-    for name, proc in processes:
+def cleanup_processes(*processes, timeout=5):
+    """Gracefully terminate all child processes.
+
+    Accepts (name, process) pairs or a trailing list built by caller.
+    """
+    # Backward compatible: cleanup_processes(server, timer) OR (server, timer, ui)
+    named = []
+    if len(processes) == 1 and isinstance(processes[0], list):
+        named = processes[0]
+    else:
+        labels = ("Server", "Timer", "PaywallUI")
+        for i, proc in enumerate(processes):
+            if proc is None:
+                continue
+            named.append((labels[i] if i < len(labels) else f"Proc{i}", proc))
+
+    for name, proc in named:
         if proc.is_alive():
             logging.info("Sending SIGTERM to %s process (PID: %d)", name, proc.pid)
             proc.terminate()
-    
-    # Ждём завершения с таймаутом
+
     start_time = time.time()
     while time.time() - start_time < timeout:
-        alive_procs = [p for _, p in processes if p.is_alive()]
+        alive_procs = [p for _, p in named if p.is_alive()]
         if not alive_procs:
             logging.info("All child processes terminated gracefully")
             return
         time.sleep(0.5)
-    
-    # Если ещё живы - убиваем SIGKILL
-    for name, proc in processes:
+
+    for name, proc in named:
         if proc.is_alive():
             logging.warning("Force killing %s process (PID: %d)", name, proc.pid)
             proc.kill()
-    
-    # Финальный join
-    for name, proc in processes:
+
+    for name, proc in named:
         proc.join(timeout=2)
         if proc.is_alive():
             logging.error("%s process still alive after kill!", name)
@@ -741,6 +770,7 @@ def signal_handler(signum, frame):
 
 
 def main():
+    import paywall_ui
     import server
     import timer
 
@@ -793,47 +823,73 @@ def main():
         pass
 
     queue_main = multiprocessing.Queue()
+    queue_to_ui = multiprocessing.Queue()
+    queue_from_ui = multiprocessing.Queue()
     server_process = None
     timer_process = None
-    
+    ui_process = None
+
     try:
-        # Запускаем server.py в отдельном процессе
         server_process = multiprocessing.Process(
             target=server.server_start_async,
-            args=(queue_main, "0.0.0.0", server_config.port),
-            daemon=False
+            args=(queue_main, "0.0.0.0", server_config.port, queue_to_ui, queue_from_ui),
+            daemon=False,
         )
         server_process.start()
         logging.info("'server.py' started (PID: %d)", server_process.pid)
-        
-        # Запускаем timer.py в отдельном процессе
+
         timer_process = multiprocessing.Process(
-            target=timer.loop, 
-            args=(queue_main,),
-            daemon=False  # Явно отмечаем как non-daemon
+            target=timer.loop,
+            args=(queue_main, queue_to_ui),
+            daemon=False,
         )
         timer_process.start()
         logging.info("'timer.py' started (PID: %d)", timer_process.pid)
-        
-        # Основной цикл main.py
+
+        ui_process = multiprocessing.Process(
+            target=paywall_ui.loop,
+            args=(queue_main, queue_to_ui, queue_from_ui),
+            daemon=False,
+        )
+        ui_process.start()
+        logging.info("'paywall_ui.py' started (PID: %d)", ui_process.pid)
+
         while True:
-            # Проверяем живы ли процессы
             if not server_process.is_alive():
                 logging.error("'server.py' died unexpectedly!")
                 break
             if not timer_process.is_alive():
                 logging.error("'timer.py' died unexpectedly!")
                 break
-            time.sleep(10)
-            
+            if ui_process is not None and not ui_process.is_alive():
+                logging.error("'paywall_ui.py' died — restarting in 5s")
+                try:
+                    while True:
+                        queue_to_ui.get_nowait()
+                except Exception:
+                    pass
+                try:
+                    queue_from_ui.put({"status": "cancelled", "message": "ui_died"})
+                except Exception:
+                    pass
+                time.sleep(5)
+                ui_process = multiprocessing.Process(
+                    target=paywall_ui.loop,
+                    args=(queue_main, queue_to_ui, queue_from_ui),
+                    daemon=False,
+                )
+                ui_process.start()
+                logging.info("'paywall_ui.py' restarted (PID: %d)", ui_process.pid)
+            time.sleep(5)
+
     except KeyboardInterrupt:
         logging.warning("MAIN service received SIGINT")
     except Exception as e:
         logging.error("Error in MAIN service: %s", str(e), exc_info=True)
     finally:
         logging.info("Shutting down child processes...")
-        if server_process and timer_process:
-            cleanup_processes(server_process, timer_process)
+        if server_process or timer_process or ui_process:
+            cleanup_processes(server_process, timer_process, ui_process)
         logging.info("MAIN service IS STOPPED")
 
 if __name__ == "__main__":
