@@ -1,3 +1,6 @@
 {
-    "extraPaths": ["scripts"]
+  "extraPaths": ["scripts"],
+  "pythonVersion": "3.12",
+  "venvPath": ".",
+  "venv": ".venv"
 }

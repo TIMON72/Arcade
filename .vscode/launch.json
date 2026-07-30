@@ -1,7 +1,4 @@
 {
-    // Используйте IntelliSense, чтобы узнать о возможных атрибутах.
-    // Наведите указатель мыши, чтобы просмотреть описания существующих атрибутов.
-    // Для получения дополнительной информации посетите: https://go.microsoft.com/fwlink/?linkid=830387
     "version": "0.2.0",
     "configurations": [
         {
@@ -9,27 +6,30 @@
             "type": "debugpy",
             "request": "launch",
             "program": "${workspaceFolder}/scripts/main.py",
-            "python": "${workspaceFolder}/venv/bin/python",
+            "python": "${workspaceFolder}/.venv/bin/python",
             "console": "integratedTerminal",
             "subProcess": true,
-            "justMyCode": true
+            "justMyCode": true,
+            "preLaunchTask": "stop-main-service"
         },
         {
             "name": "Server",
             "type": "debugpy",
             "request": "launch",
             "program": "${workspaceFolder}/scripts/server.py",
-            "python": "${workspaceFolder}/venv/bin/python",
+            "python": "${workspaceFolder}/.venv/bin/python",
             "console": "integratedTerminal",
+            "preLaunchTask": "stop-main-service"
         },
         {
             "name": "Timer",
             "type": "debugpy",
             "request": "launch",
             "program": "${workspaceFolder}/scripts/timer.py",
-            "python": "${workspaceFolder}/venv/bin/python",
-            "console": "integratedTerminal"
-        },
+            "python": "${workspaceFolder}/.venv/bin/python",
+            "console": "integratedTerminal",
+            "preLaunchTask": "stop-main-service"
+        }
     ],
     "compounds": [
         {
@@ -38,7 +38,8 @@
                 "Server",
                 "Timer"
             ],
-            "stopAll": true
+            "stopAll": true,
+            "preLaunchTask": "stop-main-service"
         }
     ]
 }

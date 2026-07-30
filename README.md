@@ -27,6 +27,8 @@ Arcade/
 ├── pins.png               # схема распиновки GPIO (BCM)
 ├── requirements.txt       # только для vendor-wheels (не deploy)
 ├── wheels/                # офлайн-пакеты pip (aarch64, Python 3.12)
+├── vendor/git/            # портативный git (tar.xz) для офлайн-установки
+├── vendor/vscode/         # VSIX Python/debugpy для Cursor SSH
 ├── configs/               # пользовательские конфиги Batocera
 ├── services/
 │   └── main               # сервис Batocera (start/stop/status)
@@ -49,13 +51,14 @@ Arcade/
 ├── .arcade-deployed       # маркер первого deploy (не в git)
 ├── batocera.conf
 ├── configs/
+├── git/                   # портативный git (из vendor/git при deploy)
 ├── services/main
 └── scripts/
     ├── main.py
     ├── modules/
     ├── wheels/            # копия из репозитория
     ├── config_main.toml
-    └── venv/              # создаётся при первом запуске
+    └── .venv/             # создаётся при первом запуске
 ```
 
 Репозиторий может лежать **где угодно** (флешка, `/userdata/system/Arcade`, и т.д.). Рабочие пути Batocera фиксированы: `/userdata/system/scripts` и `/userdata/system/services`.
@@ -66,9 +69,11 @@ Arcade/
 |-----------|-----|
 | Batocera, Python 3.12 | система |
 | `lgpio`, `aiohttp` | системный Python Batocera |
-| `luma.led_matrix` | venv (ставится офлайн из `wheels/`) |
+| `luma.led_matrix` | `.venv` (ставится офлайн из `wheels/`) |
+| `git` | `/userdata/system/git` + симлинки в `/usr/bin` (из `vendor/git/` при deploy) |
+| Cursor: Python / debugpy | remote extensions (из `vendor/vscode/*.vsix` при deploy) |
 
-Интернет на консоли **не обязателен** — wheel-файлы включены в репозиторий.
+Интернет на консоли **не обязателен** — wheel-файлы, tarball git и VSIX включены в репозиторий.
 
 ## Развёртывание на Batocera
 
@@ -89,9 +94,13 @@ python3 scripts/main.py
 
 1. Скопирует `configs/`, `services/`, `scripts/` (включая `config_main.toml`), `wheels/` в `/userdata/system/`
 2. Перезапишет `batocera.conf` версией из проекта
-3. Создаст маркер `.arcade-deployed`
-4. Создаст `venv` в `/userdata/system/scripts/` и установит `luma` из локальных wheels
-5. Перезапустится из `/userdata/system/scripts/main.py` через `venv/bin/python` и запустит таймер
+3. Установит портативный `git` из `vendor/git/` в `/userdata/system/git` и симлинки в `/usr/bin`
+4. Установит расширения Cursor `ms-python.python` и `ms-python.debugpy` (из `vendor/vscode/` или marketplace)
+5. Создаст маркер `.arcade-deployed`
+6. Создаст `.venv` в `/userdata/system/scripts/` и установит `luma` из локальных wheels
+7. Перезапустится из `/userdata/system/scripts/main.py` через `.venv/bin/python` и запустит таймер
+
+После reboot симлинки `/usr/bin/git*` восстанавливает сервис `main` при старте (корневая ФС Batocera сбрасывается).
 
 Повторный `python3 scripts/main.py` из `Arcade/` **не обновит** файлы в `/userdata/system/` — для обновлений используйте `deploy`.
 
@@ -147,8 +156,12 @@ batocera-services status main
 
 ```bash
 python3 scripts/main.py              # авто-deploy (если первый раз) + запуск
-python3 scripts/main.py deploy       # принудительный deploy
-python3 scripts/main.py vendor-wheels   # скачать wheels (нужен интернет и pip)
+python3 scripts/main.py deploy       # принудительный deploy (git + IDE extensions)
+python3 scripts/main.py install-git  # только установить git из vendor/git
+python3 scripts/main.py install-extensions  # только Cursor Python/debugpy
+python3 scripts/main.py vendor-wheels       # скачать wheels (нужен интернет и pip)
+python3 scripts/main.py vendor-git          # скачать tarball git в vendor/git/
+python3 scripts/main.py vendor-extensions   # скачать VSIX в vendor/vscode/
 ```
 
 ## Конфигурация
@@ -201,7 +214,7 @@ test_on_start = true
 ## Разработка
 
 ```bash
-# venv (создаётся автоматически при первом запуске main.py)
+# .venv (создаётся автоматически при первом запуске main.py)
 python3 scripts/main.py
 
 # Обновить wheels на машине с интернетом
@@ -213,8 +226,8 @@ git add wheels/
 
 ### Зависимости
 
-- **В git:** `wheels/` (офлайн-установка на консоли)
-- **Не в git:** `venv/`, `logs.log`, `.arcade-deployed`
+- **В git:** `wheels/`, `vendor/git/*.tar.xz`, `vendor/vscode/*.vsix` (офлайн-установка на консоли)
+- **Не в git:** `.venv/`, `venv/`, `logs.log`, `.arcade-deployed`, `/userdata/system/git`
 - **`requirements.txt`** — только для `vendor-wheels`, на Batocera не копируется
 
 ## Лицензия и авторство
