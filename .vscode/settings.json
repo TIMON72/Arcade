@@ -1,7 +1,8 @@
 {
     "python.defaultInterpreterPath": "${workspaceFolder}/.venv/bin/python",
     "python.analysis.extraPaths": [
-        "${workspaceFolder}/scripts"
+        "${workspaceFolder}/scripts",
+        "/usr/lib/python3.12/site-packages"
     ],
     "files.eol": "\n",
     "files.insertFinalNewline": true

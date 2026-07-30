@@ -14,11 +14,21 @@ GIT_LINKS="git git-shell git-receive-pack git-upload-pack git-upload-archive"
 # /usr сбрасывается при reboot — восстанавливаем симлинки на портативный git
 ensure_git_links() {
     [ -x "$GIT_ROOT/bin/git" ] || return 0
+    # cmd/git — launcher с правильным exec-path (нужен для remote-https)
+    launcher="$GIT_ROOT/cmd"
+    [ -e "$launcher/git" ] || launcher="$GIT_ROOT/bin"
     for cmd in $GIT_LINKS; do
-        if [ -e "$GIT_ROOT/bin/$cmd" ]; then
+        if [ -e "$launcher/$cmd" ]; then
+            ln -sfn "$launcher/$cmd" "/usr/bin/$cmd"
+        elif [ -e "$GIT_ROOT/bin/$cmd" ]; then
             ln -sfn "$GIT_ROOT/bin/$cmd" "/usr/bin/$cmd"
         fi
     done
+    # CA bundle для HTTPS к GitHub
+    if [ -d "$GIT_ROOT/share/git-minimal" ]; then
+        mkdir -p /usr/local/share
+        ln -sfn "$GIT_ROOT/share/git-minimal" /usr/local/share/git-minimal
+    fi
 }
 
 start() {

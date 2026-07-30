@@ -1,6 +1,15 @@
 {
-  "extraPaths": ["scripts"],
   "pythonVersion": "3.12",
-  "venvPath": ".",
-  "venv": ".venv"
+  "pythonPlatform": "Linux",
+  "executionEnvironments": [
+    {
+      "root": ".",
+      "python": "/userdata/system/scripts/.venv/bin/python",
+      "extraPaths": [
+        "scripts",
+        "/usr/lib/python3.12/site-packages",
+        "/userdata/system/scripts/.venv/lib/python3.12/site-packages"
+      ]
+    }
+  ]
 }

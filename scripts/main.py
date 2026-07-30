@@ -269,12 +269,24 @@ def _find_git_tarball(source_root: str) -> str | None:
 
 
 def link_portable_git() -> bool:
-    """Симлинки /usr/bin/git* → /userdata/system/git/bin (нужны после reboot без overlay)."""
+    """Симлинки /usr/bin/git* и CA bundle (нужны после reboot без overlay).
+
+    Важно: линкуем cmd/git (launcher), а не bin/git — иначе exec-path
+    указывает на /usr/local/libexec/git-core и ломается remote-https.
+    """
+    git_cmd = os.path.join(_GIT_INSTALL_DIR, "cmd", "git")
     git_bin = os.path.join(_GIT_INSTALL_DIR, "bin", "git")
-    if not os.path.isfile(git_bin) or not os.access(git_bin, os.X_OK):
+    if os.path.exists(git_cmd):
+        launcher_dir = os.path.join(_GIT_INSTALL_DIR, "cmd")
+    elif os.path.isfile(git_bin) and os.access(git_bin, os.X_OK):
+        launcher_dir = os.path.join(_GIT_INSTALL_DIR, "bin")
+    else:
         return False
+
     for name in _GIT_LINK_NAMES:
-        src = os.path.join(_GIT_INSTALL_DIR, "bin", name)
+        src = os.path.join(launcher_dir, name)
+        if not os.path.exists(src):
+            src = os.path.join(_GIT_INSTALL_DIR, "bin", name)
         if not os.path.exists(src):
             continue
         dst = os.path.join("/usr/bin", name)
@@ -285,6 +297,23 @@ def link_portable_git() -> bool:
         except OSError as error:
             print(f"⚠ Cannot link {dst}: {error}")
             return False
+
+    # CA для HTTPS: бинарник ждёт /usr/local/share/git-minimal/curl-ca-bundle.crt
+    ca_src = os.path.join(_GIT_INSTALL_DIR, "share", "git-minimal")
+    ca_dst_parent = "/usr/local/share"
+    ca_dst = os.path.join(ca_dst_parent, "git-minimal")
+    if os.path.isdir(ca_src):
+        try:
+            os.makedirs(ca_dst_parent, exist_ok=True)
+            if os.path.islink(ca_dst) or os.path.isfile(ca_dst):
+                os.remove(ca_dst)
+            elif os.path.isdir(ca_dst) and not os.path.islink(ca_dst):
+                pass
+            else:
+                os.symlink(ca_src, ca_dst)
+        except OSError as error:
+            print(f"⚠ Cannot link git CA bundle: {error}")
+
     return True
 
 
