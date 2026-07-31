@@ -750,6 +750,8 @@ class TimerConfig:
     time_step: int = 5
     time_wait: int = 60
     time_reset: int = 5
+    # Raspberry — Pi управляет реле/таймером; Arduino — Pi имитирует радио → Arduino
+    timer_mode: str = "Raspberry"
 
 
 @dataclass(frozen=True)
@@ -913,6 +915,21 @@ def load_gpio_config() -> GpioConfig:
     )
 
 
+def _read_timer_mode(section: dict, default: str = "Raspberry") -> str:
+    """timer_mode / mode: Raspberry (по умолчанию) или Arduino."""
+    raw = section.get("timer_mode", section.get("mode", default))
+    if not isinstance(raw, str):
+        raise ValueError("timer_mode must be a string (Raspberry or Arduino)")
+    normalized = raw.strip().lower()
+    if normalized in {"raspberry", "rpi", "pi"}:
+        return "Raspberry"
+    if normalized == "arduino":
+        return "Arduino"
+    raise ValueError(
+        f"timer_mode must be 'Raspberry' or 'Arduino', got {raw!r}"
+    )
+
+
 def load_timer_config() -> TimerConfig:
     defaults = TimerConfig()
     if not os.path.isfile(CONFIG_PATH):
@@ -929,6 +946,7 @@ def load_timer_config() -> TimerConfig:
         time_step=_read_positive_int(timer_section, "time_step", defaults.time_step),
         time_wait=_read_positive_int(timer_section, "time_wait", defaults.time_wait),
         time_reset=_read_positive_int(timer_section, "time_reset", defaults.time_reset),
+        timer_mode=_read_timer_mode(timer_section, defaults.timer_mode),
     )
 
 
@@ -1176,7 +1194,8 @@ def main():
     logging.info("MAIN service STARTED")
     logging.info("Server config: port=%d", server_config.port)
     logging.info(
-        "Timer config: time_step=%d min, time_wait=%d sec, time_reset=%d min",
+        "Timer config: mode=%s time_step=%d min, time_wait=%d sec, time_reset=%d min",
+        timer_config.timer_mode,
         timer_config.time_step,
         timer_config.time_wait,
         timer_config.time_reset,

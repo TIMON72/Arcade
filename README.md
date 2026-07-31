@@ -75,69 +75,100 @@ Arcade/
 
 Интернет на консоли **не обязателен** — wheel-файлы, tarball git и VSIX включены в репозиторий.
 
-## Развёртывание на Batocera
+## Развёртывание на автоматах
 
-Скопируйте **весь** проект на консоль (git clone, SCP, флешка) — нужны каталоги `configs/`, `services/`, `scripts/`, `wheels/` и файл `batocera.conf`. Репозиторий может лежать где угодно, например `/userdata/system/Arcade`.
+Два независимых каталога:
 
-Deploy копирует файлы в фиксированные пути Batocera: `/userdata/system/scripts`, `/userdata/system/services` и т.д. Запускать нужно **из копии проекта**, а не из `/userdata/system/scripts`.
+| Путь | Назначение |
+|------|------------|
+| `/userdata/system/Arcade` | клон git (исходники, `pull` / разработка) |
+| `/userdata/system/scripts` (+ `services/`, …) | **рабочая** копия, из которой крутится сервис |
 
-### Первый запуск
+`deploy` копирует **односторонне**: `Arcade` → `/userdata/system/`. Правки только в `scripts/` на git не влияют. Коммиты и `push` — **только с машины разработки**.
 
-При **первом** вызове `main.py` deploy выполняется автоматически (пока нет маркера `/userdata/system/.arcade-deployed`):
+Репозиторий: https://github.com/TIMON72/Arcade.git
 
-```bash
-cd /userdata/system/Arcade
-python3 scripts/main.py
-```
+### Машина разработки (этот автомат)
 
-Что произойдёт:
-
-1. Скопирует `configs/`, `services/`, `scripts/` (включая `config_main.toml`), `wheels/` в `/userdata/system/`
-2. Перезапишет `batocera.conf` версией из проекта
-3. Установит портативный `git` из `vendor/git/` в `/userdata/system/git` и симлинки в `/usr/bin`
-4. Установит расширения Cursor `ms-python.python` и `ms-python.debugpy` (из `vendor/vscode/` или marketplace)
-5. Создаст маркер `.arcade-deployed`
-6. Создаст `.venv` в `/userdata/system/scripts/` и установит `luma` из локальных wheels
-7. Перезапустится из `/userdata/system/scripts/main.py` через `.venv/bin/python` и запустит таймер
-
-После reboot симлинки `/usr/bin/git*` восстанавливает сервис `main` при старте (корневая ФС Batocera сбрасывается).
-
-Повторный `python3 scripts/main.py` из `Arcade/` **не обновит** файлы в `/userdata/system/` — для обновлений используйте `deploy`.
-
-### Обновление файлов
-
-Принудительно перезаписывает файлы в `/userdata/system/`, даже если deploy уже выполнялся:
+Код правите в `Arcade`, проверяете через deploy:
 
 ```bash
 cd /userdata/system/Arcade
+# … правки, commit …
+git push origin main
+
 python3 scripts/main.py deploy
 batocera-services restart main
 ```
 
-Альтернатива: удалить маркер и снова запустить `main.py`:
+### Другой автомат — первая установка
+
+Нужны сеть и доступ к GitHub (для private — токен/ключ).
 
 ```bash
-rm /userdata/system/.arcade-deployed
+cd /userdata/system
+git clone https://github.com/TIMON72/Arcade.git Arcade
+cd Arcade
 python3 scripts/main.py
+batocera-services enable main
+batocera-services restart main
 ```
+
+Первый `main.py` (пока нет `/userdata/system/.arcade-deployed`) сам сделает deploy и поднимет таймер:
+
+1. Скопирует `configs/`, `services/`, `scripts/` (включая `config_main.toml`), `wheels/` в `/userdata/system/`
+2. Перезапишет `batocera.conf`
+3. Установит портативный `git` из `vendor/git/` и симлинки в `/usr/bin`
+4. Установит расширения Cursor Python/debugpy (из `vendor/vscode/` или marketplace)
+5. Создаст маркер `.arcade-deployed`
+6. Создаст `.venv` в `/userdata/system/scripts/` и поставит `luma` из wheels
+7. Перезапустится из `/userdata/system/scripts/main.py`
+
+После reboot симлинки `/usr/bin/git*` поднимает сервис `main` (корневая ФС Batocera сбрасывается).
+
+Опционально запретить случайный `push` с продакшен-автомата:
+
+```bash
+cd /userdata/system/Arcade
+git remote set-url --push origin DISABLED
+```
+
+`git pull` при этом продолжит работать.
+
+Локальные отличия (телефон в бегущей строке, `timer_mode` и т.п.) правьте в **рабочем** конфиге:
+
+```bash
+nano /userdata/system/scripts/config_main.toml
+batocera-services restart main
+```
+
+`deploy` снова перезапишет этот файл из репозитория — либо держите машинно-специфичное в git (отдельные значения/ветки), либо поправляйте после каждого обновления.
+
+### Другой автомат — обновление через pull
+
+На машине разработки: `git push origin main`.  
+На втором автомате:
+
+```bash
+cd /userdata/system/Arcade
+git pull origin main
+python3 scripts/main.py deploy
+batocera-services restart main
+```
+
+Повторный `python3 scripts/main.py` из `Arcade/` **не** обновляет `/userdata/system/` — только `deploy` (или удаление маркера `.arcade-deployed` и снова `main.py`).
 
 ### Сравнение команд
 
 | Команда | Deploy | Запуск таймера | Когда использовать |
 |---------|--------|----------------|-------------------|
 | `python3 scripts/main.py` | только первый раз | да | первая установка |
-| `python3 scripts/main.py deploy` | всегда | нет | обновление файлов |
+| `python3 scripts/main.py deploy` | всегда | нет | после `git pull` / правок |
 | `batocera-services restart main` | нет | через сервис | обычный перезапуск |
 
 ### Автозапуск при загрузке
 
-В `batocera.conf` проекта указано `system.services=main` — после deploy оно попадает в `/userdata/system/batocera.conf`. Перезагрузите консоль:
-
-```bash
-reboot
-```
-
-Или включите сервис вручную: `batocera-services enable main`
+В `batocera.conf` проекта: `system.services=main` — после deploy попадает в `/userdata/system/batocera.conf`. Либо `reboot`, либо `batocera-services enable main`.
 
 ### Логи и проверка
 
@@ -150,7 +181,7 @@ batocera-services status main
 | Сервис (stdout/stderr) | `/userdata/system/logs/main-service.log` |
 | Приложение | `/userdata/system/scripts/logs.log` |
 
-В логе должны быть строки `MAIN service STARTED` и `'server.py' started`. Веб-интерфейс: `http://<IP-консоли>:5000/`
+В логе: `MAIN service STARTED`, `'server.py' started`. Веб: `http://<IP-консоли>:5000/`
 
 ## Команды main.py
 
@@ -173,11 +204,14 @@ python3 scripts/main.py vendor-extensions   # скачать VSIX в vendor/vsco
 port = 5000
 
 [timer]
+timer_mode = "Raspberry"  # или "Arduino" — Pi имитирует радио на rf_* → Arduino
 time_step = 5      # шаг «+», минуты
 time_wait = 60     # пауза после окончания, секунды
 time_reset = 5       # автосброс без старта, минуты
 
 [gpio]
+# Raspberry: rf_*=вход пульта, r_*=выход реле
+# Arduino:  rf_*=выход «радио», r_*=вход состояния с Arduino
 rf_increase = 5
 rf_playpause = 6
 rf_stop = 13
@@ -213,10 +247,11 @@ test_on_start = true
 ![Распиновка GPIO (BCM)](pins.png)
 
 - **Raspberry Pi 5** с Batocera
-- Реле автомата (GPIO 17, 27, 22)
-- RF-кнопки пульта (GPIO 5, 6, 13)
+- Режим `timer_mode`: **Raspberry** (Pi управляет реле/таймером/матрицей) или **Arduino** (Pi шлёт импульсы на rf_* 5/6/13, читает состояние с r_* 17/27/22)
+- Реле автомата (GPIO 17, 27, 22) — выходы в режиме Raspberry
+- RF-кнопки пульта (GPIO 5, 6, 13) — входы в режиме Raspberry; в режиме Arduino — выходы «имитация радио»
 - Сухой контакт терминала (GPIO 26 / физ. 37 + GND / физ. 39): замыкание на землю = импульс; каждый импульс = `+time_step`, после `start_delay_ms` — автозапуск
-- MAX7219: 4 модуля 8×8 в ряд, bitbang SPI (DIN=10, CLK=11, CS=8)
+- MAX7219: 4 модуля 8×8 в ряд, bitbang SPI (DIN=10, CLK=11, CS=8) — в режиме Raspberry
 - Общая земля Pi и блока питания матрицы обязательна
 
 ## Разработка

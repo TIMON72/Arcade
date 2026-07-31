@@ -2,6 +2,9 @@
 port = 5000
 
 [timer]
+# Режим: Raspberry (Pi — хозяин реле/таймера) или Arduino (Pi имитирует радио → Arduino)
+timer_mode = "Raspberry"
+
 # Шаг увеличения времени кнопкой "+" (минуты)
 time_step = 5
 
@@ -12,12 +15,12 @@ time_wait = 60
 time_reset = 5
 
 [gpio]
-# Входы: кнопки пульта (BCM, см. pins.png)
+# Пины RF (BCM): в режиме Raspberry — входы пульта; в Arduino — выходы «имитация радио»
 rf_increase = 5      # "+"
 rf_playpause = 6     # Play/Pause
 rf_stop = 13         # Stop
 
-# Выходы: реле автомата (BCM)
+# Пины реле (BCM): в режиме Raspberry — выходы на автомат; в Arduino — входы состояния
 r_buttons = 17       # IN1–IN6
 r_playpause = 27     # IN7
 r_stop = 22          # IN8
