@@ -764,6 +764,16 @@ class GpioConfig:
 
 
 @dataclass(frozen=True)
+class TerminalConfig:
+    """Сухой контакт терминала (Arduino TERM_OUT_CASHLESS)."""
+    enabled: bool = True
+    pin: int = 26
+    active_high: bool = False
+    debounce_ms: int = 0
+    start_delay_ms: int = 2000
+
+
+@dataclass(frozen=True)
 class MatrixConfig:
     enabled: bool = True
     brightness: int = 7
@@ -922,6 +932,27 @@ def load_timer_config() -> TimerConfig:
     )
 
 
+def load_terminal_config() -> TerminalConfig:
+    defaults = TerminalConfig()
+    if not os.path.isfile(CONFIG_PATH):
+        return defaults
+
+    with open(CONFIG_PATH, "rb") as config_file:
+        data = tomllib.load(config_file)
+
+    section = data.get("terminal", {})
+    if not isinstance(section, dict):
+        raise ValueError("[terminal] section must be a table")
+
+    return TerminalConfig(
+        enabled=_read_bool(section, "enabled", defaults.enabled),
+        pin=_read_bcm_pin(section, "pin", defaults.pin),
+        active_high=_read_bool(section, "active_high", defaults.active_high),
+        debounce_ms=_read_non_negative_int(section, "debounce_ms", defaults.debounce_ms),
+        start_delay_ms=_read_positive_int(section, "start_delay_ms", defaults.start_delay_ms),
+    )
+
+
 def load_matrix_config() -> MatrixConfig:
     defaults = MatrixConfig()
     if not os.path.isfile(CONFIG_PATH):
@@ -956,6 +987,7 @@ try:
     server_config = load_server_config()
     timer_config = load_timer_config()
     gpio_config = load_gpio_config()
+    terminal_config = load_terminal_config()
     matrix_config = load_matrix_config()
 except (tomllib.TOMLDecodeError, ValueError, OSError) as error:
     print(f"ERROR: Failed to load config from {CONFIG_PATH}: {error}", file=sys.stderr)
@@ -1158,6 +1190,14 @@ def main():
         gpio_config.r_playpause,
         gpio_config.r_stop,
         gpio_config.relay_active_low,
+    )
+    logging.info(
+        "Terminal config: enabled=%s pin=%d active_high=%s debounce=%dms start_delay=%dms",
+        terminal_config.enabled,
+        terminal_config.pin,
+        terminal_config.active_high,
+        terminal_config.debounce_ms,
+        terminal_config.start_delay_ms,
     )
     logging.info(
         "Matrix config: enabled=%s brightness=%d din/clk/cs=%d/%d/%d cascaded=%d",

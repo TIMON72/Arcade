@@ -36,8 +36,193 @@ class Button:
         return False
 
 
+class TerminalCashless:
+    """Сухой контакт терминала — логика как terminalCashlessProcess() в Arduino 0.21.
+
+    Типичная схема: GPIO26 + GND (физ. 37 и 39). Замыкание тянет пин к 0.
+    Нужны PULL_UP и active_high=false (покой=1, импульс=0) — как INPUT_PULLUP на Arduino.
+    Короткие импульсы: lgpio alert/callback + опрос в process().
+    """
+
+    def __init__(self, pin, active_high=False, debounce_ms=0, start_delay_ms=2000):
+        self.pin = pin
+        self.active_high = active_high
+        self.debounce_s = max(0, debounce_ms) / 1000.0
+        self.start_delay_s = max(1, start_delay_ms) / 1000.0
+        self.active_level = 1 if active_high else 0
+        self._h = None
+        self._cb = None
+        self._edge_q: queue.Queue = queue.Queue()
+        self._initialized = False
+        self._stable_state = 0 if active_high else 1
+        self._last_raw_state = self._stable_state
+        self._raw_changed_at = 0.0
+        self._contact_closed_at = 0.0
+        self._last_contact_opened_at = 0.0
+        self._pulse_count = 0
+        self._start_pending = False
+        self._restart_from_waiter = False
+
+    def _on_edge(self, chip, gpio, level, timestamp):
+        # level: 0/1; игнор таймаутов/прочего
+        if level not in (0, 1):
+            return
+        self._edge_q.put((int(level), time.monotonic()))
+
+    def setup(self, chip_handle):
+        pull = lgpio.SET_PULL_DOWN if self.active_high else lgpio.SET_PULL_UP
+        # alert нужен, чтобы callback ловил короткие импульсы
+        try:
+            lgpio.gpio_claim_alert(chip_handle, self.pin, lgpio.BOTH_EDGES, pull)
+        except Exception:
+            lgpio.gpio_claim_input(chip_handle, self.pin, pull)
+        try:
+            level = int(lgpio.gpio_read(chip_handle, self.pin))
+        except Exception:
+            level = 0 if self.active_high else 1
+        now = time.monotonic()
+        self._h = chip_handle
+        self._stable_state = level
+        self._last_raw_state = level
+        self._raw_changed_at = now
+        self._initialized = True
+        self._cb = lgpio.callback(chip_handle, self.pin, lgpio.BOTH_EDGES, self._on_edge)
+        print(
+            f"TERM_OUT_CASHLESS READY pin={self.pin} "
+            f"active_high={self.active_high} level={level} "
+            f"debounce={int(self.debounce_s * 1000)}ms "
+            f"start_delay={int(self.start_delay_s * 1000)}ms"
+        )
+
+    def teardown(self):
+        if self._cb is not None:
+            try:
+                self._cb.cancel()
+            except Exception:
+                pass
+            self._cb = None
+        if self._h is not None:
+            try:
+                lgpio.gpio_free(self._h, self.pin)
+            except Exception:
+                pass
+        self._h = None
+        self._initialized = False
+        while not self._edge_q.empty():
+            try:
+                self._edge_q.get_nowait()
+            except queue.Empty:
+                break
+
+    def _on_pulse_closed(self):
+        """Один стабильный импульс (замыкание контакта) — как в Arduino."""
+        global hours, minutes, seconds, activated
+
+        print("TERM_OUT_CASHLESS CLOSED")
+        if waited:
+            # Окно ожидания: доплата. Первый импульс сбрасывает отсчёт ожидания.
+            if not self._restart_from_waiter:
+                self._restart_from_waiter = True
+                activated = False
+                hours = time_main[0]
+                minutes = time_main[1]
+                seconds = time_main[2]
+                print("TERM_OUT_CASHLESS waiter: payment started")
+            self._pulse_count += 1
+            self._start_pending = True
+            if hours < time_max:
+                minutes += time_step
+                if minutes > 59:
+                    hours += 1
+                    minutes = minutes % 60
+            matrix_show_time()
+            tick_timer.refresh()
+            log_time()
+            sync_state_flags()
+            log_timer_state("cashless waiter pulse")
+        else:
+            self._pulse_count += 1
+            self._start_pending = True
+            log_button("TERM_CASHLESS", "terminal")
+            handle_increase("terminal")
+            log_timer_state("cashless pulse")
+
+    def _on_batch_complete(self):
+        """Серия импульсов закончилась — автозапуск / возобновление."""
+        global start, activated, waited
+
+        print(f"TERM_OUT_CASHLESS batch complete: pulses={self._pulse_count}")
+        self._pulse_count = 0
+
+        if self._restart_from_waiter and not is_timer_empty():
+            self._restart_from_waiter = False
+            start = False
+            activated = False
+            waited = False
+            sync_state_flags()
+            print("TERM_OUT_CASHLESS action: restart from waiter")
+            log_button("TERM_CASHLESS PLAY", "terminal")
+            handle_playpause("terminal")
+            tick_timer.refresh()
+            log_timer_state("cashless waiter restart")
+        elif not activated and not waited and not is_timer_empty():
+            print("TERM_OUT_CASHLESS action: start/resume")
+            log_button("TERM_CASHLESS PLAY", "terminal")
+            handle_playpause("terminal")
+            tick_timer.refresh()
+            log_timer_state("cashless start/resume")
+        elif activated:
+            print("TERM_OUT_CASHLESS action: timer already running, time added only")
+            log_timer_state("cashless running")
+
+    def process(self):
+        if not self._initialized or self._h is None:
+            return
+
+        now = time.monotonic()
+        while True:
+            try:
+                raw_state, _edge_at = self._edge_q.get_nowait()
+            except queue.Empty:
+                break
+            if raw_state != self._last_raw_state:
+                self._last_raw_state = raw_state
+                self._raw_changed_at = now
+
+        # Актуальный уровень (на случай пропуска края в очереди)
+        try:
+            live = int(lgpio.gpio_read(self._h, self.pin))
+            if live != self._last_raw_state:
+                self._last_raw_state = live
+                self._raw_changed_at = now
+        except Exception:
+            pass
+
+        if (
+            self._last_raw_state != self._stable_state
+            and (now - self._raw_changed_at) >= self.debounce_s
+        ):
+            self._stable_state = self._last_raw_state
+            if self._stable_state == self.active_level:
+                self._contact_closed_at = now
+                self._on_pulse_closed()
+            else:
+                self._last_contact_opened_at = now
+                duration_ms = int((now - self._contact_closed_at) * 1000)
+                print(f"TERM_OUT_CASHLESS OPEN: duration={duration_ms} ms")
+
+        if (
+            self._start_pending
+            and self._stable_state != self.active_level
+            and (now - self._last_contact_opened_at) >= self.start_delay_s
+        ):
+            self._start_pending = False
+            self._on_batch_complete()
+
+
 # Пины GPIO и реле — из config_main.toml [gpio]
 _gpio_cfg = app_main.gpio_config
+_terminal_cfg = app_main.terminal_config
 
 RF_INCREASE = _gpio_cfg.rf_increase
 RF_PLAYPAUSE = _gpio_cfg.rf_playpause
@@ -68,6 +253,7 @@ h: int | None = None
 b_increase: Button | None = None
 b_playpause: Button | None = None
 b_stop: Button | None = None
+terminal_cashless: TerminalCashless | None = None
 
 # Флаги для отслеживания каких контактов удалось выделить
 gpio_pins_available = {name: False for name in {**OUTPUT_PINS, **INPUT_PINS}}
@@ -489,10 +675,13 @@ _gpio_unavailable_warned = False
 
 
 def teardown_gpio():
-    global h, b_increase, b_playpause, b_stop
+    global h, b_increase, b_playpause, b_stop, terminal_cashless
     if h is None:
         return
     try:
+        if terminal_cashless is not None:
+            terminal_cashless.teardown()
+            terminal_cashless = None
         for pin_name, pin in OUTPUT_PINS.items():
             if gpio_pins_available.get(pin_name):
                 try:
@@ -513,12 +702,13 @@ def teardown_gpio():
         b_increase = None
         b_playpause = None
         b_stop = None
+        terminal_cashless = None
         for key in gpio_pins_available:
             gpio_pins_available[key] = False
 
 
 def setup():
-    global h, b_increase, b_playpause, b_stop, gpio_pins_available
+    global h, b_increase, b_playpause, b_stop, gpio_pins_available, terminal_cashless
     if h is not None and any(gpio_pins_available.values()):
         return
     print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - Timer started")
@@ -528,6 +718,13 @@ def setup():
         f"RF_INCREASE={RF_INCREASE}, RF_PLAYPAUSE={RF_PLAYPAUSE}, RF_STOP={RF_STOP}, "
         f"R_BUTTONS={R_BUTTONS}, R_PLAYPAUSE={R_PLAYPAUSE}, R_STOP={R_STOP}, "
         f"relay_active_low={isRelayLow}"
+    )
+    print(
+        "Terminal: "
+        f"enabled={_terminal_cfg.enabled}, pin={_terminal_cfg.pin}, "
+        f"active_high={_terminal_cfg.active_high}, "
+        f"debounce_ms={_terminal_cfg.debounce_ms}, "
+        f"start_delay_ms={_terminal_cfg.start_delay_ms}"
     )
     setup_matrix_display()
     try:
@@ -570,8 +767,24 @@ def setup():
                 gpio_pins_available[pin_name] = False
                 print(f"GPIO {pin_name}({pin}) -> BUSY ({e})")
 
+        if _terminal_cfg.enabled:
+            try:
+                terminal_cashless = TerminalCashless(
+                    pin=_terminal_cfg.pin,
+                    active_high=_terminal_cfg.active_high,
+                    debounce_ms=_terminal_cfg.debounce_ms,
+                    start_delay_ms=_terminal_cfg.start_delay_ms,
+                )
+                terminal_cashless.setup(h)
+                print(f"GPIO TERM_CASHLESS({_terminal_cfg.pin}) -> OK (input/alert)")
+            except Exception as e:
+                terminal_cashless = None
+                print(f"GPIO TERM_CASHLESS({_terminal_cfg.pin}) -> BUSY ({e})")
+        else:
+            print("Terminal cashless: disabled in config")
+
         print(f"GPIO summary: {sum(gpio_pins_available.values())}/{len(gpio_pins_available)} pins available")
-        if not any(gpio_pins_available.values()):
+        if not any(gpio_pins_available.values()) and terminal_cashless is None:
             teardown_gpio()
         else:
             log_ready()
@@ -588,6 +801,8 @@ def loop(queue_main = None):
     try:
         while True:
             updateState()
+            if terminal_cashless is not None:
+                terminal_cashless.process()
             if (
                 gpio_inputs_ready()
                 and b_increase is not None
@@ -608,13 +823,13 @@ def loop(queue_main = None):
                 _gpio_unavailable_warned = True
             try:
                 if queue_main is not None:
-                    signal = queue_main.get(timeout=0.1)
+                    signal = queue_main.get(timeout=0.02)
                     action(signal)
             except queue.Empty:
                 pass
             update_matrix_idle()
             tick(1000)
-            time.sleep(0.1)
+            time.sleep(0.02)
     finally:
         teardown_gpio()
 

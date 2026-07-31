@@ -186,6 +186,13 @@ r_playpause = 27
 r_stop = 22
 relay_active_low = true
 
+[terminal]
+enabled = true
+pin = 26             # BCM / физ. 37; GND = физ. 39
+active_high = false  # покой=1 (pull-up), импульс=0 (замыкание на GND)
+debounce_ms = 0
+start_delay_ms = 2000
+
 [matrix]
 enabled = true
 brightness = 7
@@ -208,6 +215,7 @@ test_on_start = true
 - **Raspberry Pi 5** с Batocera
 - Реле автомата (GPIO 17, 27, 22)
 - RF-кнопки пульта (GPIO 5, 6, 13)
+- Сухой контакт терминала (GPIO 26 / физ. 37 + GND / физ. 39): замыкание на землю = импульс; каждый импульс = `+time_step`, после `start_delay_ms` — автозапуск
 - MAX7219: 4 модуля 8×8 в ряд, bitbang SPI (DIN=10, CLK=11, CS=8)
 - Общая земля Pi и блока питания матрицы обязательна
 

@@ -25,6 +25,17 @@ r_stop = 22          # IN8
 # true = реле включается уровнем LOW (как в Arduino-проекте)
 relay_active_low = true
 
+[terminal]
+# Сухой контакт безналичной оплаты (как TERM_OUT_CASHLESS в Arduino 0.21)
+# BCM 26 = физ. 37, GND = физ. 39. Замыкание на GND → импульс LOW.
+enabled = true
+pin = 26
+active_high = false  # покой=1 (pull-up), импульс=0 (замыкание на GND)
+# Фильтр дребезга, мс (0 = без фильтра; меньше длительности импульса терминала)
+debounce_ms = 0
+# Пауза после серии импульсов до автозапуска игры, мс
+start_delay_ms = 2000
+
 [matrix]
 enabled = true
 brightness = 7
