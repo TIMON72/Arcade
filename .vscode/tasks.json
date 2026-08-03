@@ -4,12 +4,20 @@
         {
             "label": "stop-main-service",
             "type": "shell",
-            "command": "batocera-services stop main; true",
+            "command": "batocera-services stop main >/dev/null 2>&1 || true; echo stop-main-service: done",
+            "options": {
+                "cwd": "${workspaceFolder}",
+                "shell": {
+                    "executable": "/bin/bash",
+                    "args": ["-lc"]
+                }
+            },
             "problemMatcher": [],
             "presentation": {
                 "reveal": "silent",
                 "panel": "shared",
-                "showReuseMessage": false
+                "showReuseMessage": false,
+                "close": true
             }
         }
     ]

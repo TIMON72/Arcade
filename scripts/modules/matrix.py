@@ -166,34 +166,34 @@ def set_brightness(level):
     _device.contrast(min(15, max(0, level)) * 16)
 
 
-def _ensure_framebuffer():
+def _ensure_framebuffer() -> Image.Image:
     global _framebuffer
-    if _device is not None and _framebuffer is None:
+    if _device is None:
+        raise RuntimeError("Matrix device is not initialized")
+    if _framebuffer is None:
         _framebuffer = Image.new("1", _device.size)
+    return _framebuffer
 
 
 def clear():
-    global _framebuffer
     if _device is None:
         return
-    _ensure_framebuffer()
-    _framebuffer.paste(0, (0, 0, _device.width, _device.height))
+    fb = _ensure_framebuffer()
+    fb.paste(0, (0, 0, _device.width, _device.height))
 
 
 def flush():
     """Отправить буфер на матрицу (аналог matrix.update())."""
     if _device is None:
         return
-    _ensure_framebuffer()
-    _device.display(_framebuffer)
+    _device.display(_ensure_framebuffer())
 
 
 def dot(x, y, on=True):
     """Поставить точку. Для нескольких точек вызывайте flush() в конце."""
     if _device is None:
         return
-    _ensure_framebuffer()
-    _framebuffer.putpixel((x, y), 1 if on else 0)
+    _ensure_framebuffer().putpixel((x, y), 1 if on else 0)
 
 
 def _blit_glyph(glyph, offset_x, offset_y):

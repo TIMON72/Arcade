@@ -12,7 +12,9 @@ import tempfile
 import platform
 import gzip
 import tomllib
+import threading
 from dataclasses import dataclass
+from datetime import datetime
 from urllib.request import urlretrieve
 
 # stdlib venv: не `import venv` — Pyright путает со каталогом/.venv
@@ -736,8 +738,23 @@ if __name__ == "__main__":
 
 SCRIPT_DIR = _SCRIPT_DIR
 PROJECT_ROOT = _find_project_root()
-LOG_FILE = os.path.join(PROJECT_ROOT, "logs.log")
+LOG_FILE = os.path.join(SCRIPT_DIR, "logs.log")
 CONFIG_PATH = os.path.join(SCRIPT_DIR, _CONFIG_FILENAME)
+
+_log_lock = threading.Lock()
+
+
+def log(message: str) -> None:
+    """Строка в консоль и в scripts/logs.log с датой/временем."""
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"{stamp} - INFO - {message}"
+    with _log_lock:
+        print(line, flush=True)
+        try:
+            with open(LOG_FILE, "a", encoding="utf-8") as log_file:
+                log_file.write(line + "\n")
+        except OSError:
+            pass
 
 
 @dataclass(frozen=True)
@@ -1180,11 +1197,12 @@ def main():
 
     logging.basicConfig(
         level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s',
+        format="%(asctime)s - %(levelname)s - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
         handlers=[
-            logging.FileHandler(LOG_FILE, encoding='utf-8'),
+            logging.FileHandler(LOG_FILE, encoding="utf-8"),
             logging.StreamHandler(sys.stderr),
-        ]
+        ],
     )
 
     # Регистрируем обработчики сигналов

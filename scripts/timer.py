@@ -3,7 +3,6 @@ import queue
 import lgpio
 import sys
 import time
-from datetime import datetime
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if _SCRIPT_DIR not in sys.path:
@@ -473,39 +472,59 @@ def show_timer_inline():
     _timer_line_active = True
 
 
-def timer_state_name():
+def machine_state_label():
+    """Текущее логическое состояние для ACT [from …]."""
     if state_waiting:
         return "WAITING"
     if state_playing:
         return "PLAYING"
     if state_starting:
-        return "START"
+        return "STARTING"
     return "UNKNOWN"
 
 
-def log_timer_state(reason=""):
+def timer_state_name():
+    return machine_state_label()
+
+
+def log_state(name, reason=""):
     global _last_logged_state
     finish_timer_line()
-    name = timer_state_name()
     if name == _last_logged_state and not reason:
         return
     _last_logged_state = name
     if reason:
-        print(f"STATE: {name} ({reason})")
+        app_main.log(f"STATE: {name} ({reason})")
     else:
-        print(f"STATE: {name}")
+        app_main.log(f"STATE: {name}")
+
+
+def log_timer_state(reason=""):
+    log_state(timer_state_name(), reason)
 
 
 def log_ready():
-    global _last_logged_state
+    log_state("READY")
+
+
+def log_act(command, source, goal="", from_state=""):
     finish_timer_line()
-    _last_logged_state = "READY"
-    print("STATE: READY")
+    from_state = from_state or machine_state_label()
+    parts = [f"ACT: {command} ({source})"]
+    if goal:
+        parts.append(f"→ {goal}")
+    if from_state:
+        parts.append(f"[from {from_state}]")
+    app_main.log(" ".join(parts))
 
 
 def log_button(name, source="radio"):
+    log_act(name, source)
+
+
+def log_time():
     finish_timer_line()
-    print(f"BTN: {name} ({source})")
+    app_main.log(f"TIME: {hours:02d}:{minutes:02d}:{seconds:02d}")
 
 
 def is_timer_empty():
@@ -522,11 +541,6 @@ def sync_state_flags():
         state_starting, state_playing, state_waiting = False, True, False
     else:
         state_starting, state_playing, state_waiting = False, False, False
-
-
-def log_time():
-    finish_timer_line()
-    print(f"TIME: {hours:02d}:{minutes:02d}:{seconds:02d}")
 
 
 def _console_start_countdown():
@@ -558,12 +572,12 @@ def handle_playpause(source="radio"):
     finish_timer_line()
     if not start:
         if is_timer_empty():
-            print("BTN: PLAYPAUSE ignored: timer not set (00:00:00)")
+            app_main.log("ACT: PLAYPAUSE ignored — timer 00:00:00")
             return
         matrix_show_start()
-        print(f"RELAY: R_PLAYPAUSE({R_PLAYPAUSE}) click")
+        app_main.log(f"RELAY: R_PLAYPAUSE({R_PLAYPAUSE}) click")
         relay_click(R_PLAYPAUSE)
-        print(f"RELAY: R_BUTTONS({R_BUTTONS}) activate")
+        app_main.log(f"RELAY: R_BUTTONS({R_BUTTONS}) activate")
         relay_activate(R_BUTTONS)
         start = True
         activated = True
@@ -572,27 +586,27 @@ def handle_playpause(source="radio"):
         log_timer_state("play")
         tick_timer.refresh()
     elif activated and not waited:
-        print(f"RELAY: R_PLAYPAUSE({R_PLAYPAUSE}) click")
+        app_main.log(f"RELAY: R_PLAYPAUSE({R_PLAYPAUSE}) click")
         relay_click(R_PLAYPAUSE)
-        print(f"RELAY: R_BUTTONS({R_BUTTONS}) deactivate")
+        app_main.log(f"RELAY: R_BUTTONS({R_BUTTONS}) deactivate")
         relay_deactivate(R_BUTTONS)
         matrix_show_text("ПАУЗА")
-        print("STATE: PAUSE")
+        log_state("PAUSE")
         activated = False
         sync_state_flags()
         tick_timer.refresh()
     elif not activated and not waited:
         matrix_show_start()
-        print(f"RELAY: R_PLAYPAUSE({R_PLAYPAUSE}) click")
+        app_main.log(f"RELAY: R_PLAYPAUSE({R_PLAYPAUSE}) click")
         relay_click(R_PLAYPAUSE)
-        print(f"RELAY: R_BUTTONS({R_BUTTONS}) activate")
+        app_main.log(f"RELAY: R_BUTTONS({R_BUTTONS}) activate")
         relay_activate(R_BUTTONS)
         activated = True
         sync_state_flags()
         log_timer_state("play")
         tick_timer.refresh()
     elif waited and not activated:
-        print(f"RELAY: R_PLAYPAUSE({R_PLAYPAUSE}) click")
+        app_main.log(f"RELAY: R_PLAYPAUSE({R_PLAYPAUSE}) click")
         relay_click(R_PLAYPAUSE)
         relay_deactivate(R_BUTTONS)
         activated = True
@@ -618,9 +632,9 @@ def handle_playpause(source="radio"):
 def handle_stop(source="radio"):
     global start, activated, waited, hours, minutes, seconds
     finish_timer_line()
-    print(f"RELAY: R_STOP({R_STOP}) click")
+    app_main.log(f"RELAY: R_STOP({R_STOP}) click")
     relay_click(R_STOP)
-    print(f"RELAY: R_BUTTONS({R_BUTTONS}) deactivate")
+    app_main.log(f"RELAY: R_BUTTONS({R_BUTTONS}) deactivate")
     relay_deactivate(R_BUTTONS)
     matrix_show_text("КОНЕЦ")
     start = False
@@ -663,14 +677,21 @@ def relay_click(relay: int):
 def rf_click(rf_pin: int):
     """Имитация нажатия радиокнопки (выход HIGH ~1 с) — режим Arduino / init."""
     if h is None:
-        print(f"RF: skip click pin={rf_pin} (GPIO not open)")
+        app_main.log(f"RF: skip click pin={rf_pin} (GPIO not open)")
         return
     pin_name = PIN_TO_OUTPUT_NAME.get(rf_pin)
     if pin_name and not gpio_pins_available.get(pin_name):
-        print(f"RF: skip click {pin_name}({rf_pin}) (not available)")
+        app_main.log(f"RF: skip click {pin_name}({rf_pin}) (not available)")
         return
     label = RF_PIN_NAMES.get(rf_pin, str(rf_pin))
-    print(f"RF: {label}({rf_pin}) click")
+    # Короткие имена для лога: INCREASE / PLAYPAUSE / STOP
+    short = {
+        RF_INCREASE: "INCREASE",
+        RF_PLAYPAUSE: "PLAYPAUSE",
+        RF_STOP: "STOP",
+    }.get(rf_pin, label)
+    finish_timer_line()
+    app_main.log(f"RF: {short}({rf_pin}) pulse")
     lgpio.gpio_write(h, rf_pin, 1)
     time.sleep(1)
     lgpio.gpio_write(h, rf_pin, 0)
@@ -678,8 +699,6 @@ def rf_click(rf_pin: int):
 
 def do_increase(source="api"):
     if is_arduino_mode():
-        if source != "terminal":
-            log_button("INCREASE (+)", source)
         rf_click(RF_INCREASE)
     else:
         handle_increase(source)
@@ -687,8 +706,6 @@ def do_increase(source="api"):
 
 def do_playpause(source="api"):
     if is_arduino_mode():
-        if source != "terminal":
-            log_button("PLAYPAUSE", source)
         rf_click(RF_PLAYPAUSE)
     else:
         handle_playpause(source)
@@ -696,8 +713,6 @@ def do_playpause(source="api"):
 
 def do_stop(source="api"):
     if is_arduino_mode():
-        if source != "terminal":
-            log_button("STOP", source)
         rf_click(RF_STOP)
     else:
         handle_stop(source)
@@ -709,7 +724,7 @@ def _on_countdown_finished():
     if not waited:
         waited = True
         activated = False
-        print(f"RELAY: R_PLAYPAUSE({R_PLAYPAUSE}) click")
+        app_main.log(f"RELAY: R_PLAYPAUSE({R_PLAYPAUSE}) click")
         relay_click(R_PLAYPAUSE)
         relay_deactivate(R_BUTTONS)
         activated = True
@@ -795,19 +810,22 @@ def setup():
     global h, b_increase, b_playpause, b_stop, gpio_pins_available, terminal_cashless
     if h is not None and any(gpio_pins_available.values()):
         return
-    print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - Timer started")
-    print(f"Config: timer_mode={TIMER_MODE}, time_step={time_step} min, time_wait={time_wait} sec, time_reset={time_reset} min")
-    print(
+    app_main.log("Timer started")
+    app_main.log(
+        f"Config: timer_mode={TIMER_MODE}, time_step={time_step} min, "
+        f"time_wait={time_wait} sec, time_reset={time_reset} min"
+    )
+    app_main.log(
         "GPIO: "
         f"RF_INCREASE={RF_INCREASE}, RF_PLAYPAUSE={RF_PLAYPAUSE}, RF_STOP={RF_STOP}, "
         f"R_BUTTONS={R_BUTTONS}, R_PLAYPAUSE={R_PLAYPAUSE}, R_STOP={R_STOP}, "
         f"relay_active_low={isRelayLow}"
     )
     if is_arduino_mode():
-        print("Mode Arduino: RF pins = OUTPUT (radio sim), R_* pins = INPUT (state from Arduino)")
+        app_main.log("Mode Arduino: RF pins = OUTPUT (radio sim), R_* pins = INPUT (state from Arduino)")
     else:
-        print("Mode Raspberry: RF pins = INPUT (remote), R_* pins = OUTPUT (relays)")
-    print(
+        app_main.log("Mode Raspberry: RF pins = INPUT (remote), R_* pins = OUTPUT (relays)")
+    app_main.log(
         "Terminal: "
         f"enabled={_terminal_cfg.enabled}, pin={_terminal_cfg.pin}, "
         f"active_high={_terminal_cfg.active_high}, "
@@ -817,7 +835,7 @@ def setup():
     if is_raspberry_mode():
         setup_matrix_display()
     else:
-        print("Matrix: skipped (timer_mode=Arduino — display on Arduino)")
+        app_main.log("Matrix: skipped (timer_mode=Arduino — display on Arduino)")
     try:
         gpiochip = None
         for i in range(10):
@@ -890,9 +908,15 @@ def setup():
         if not any(gpio_pins_available.values()) and terminal_cashless is None:
             teardown_gpio()
         else:
+            if is_arduino_mode() and gpio_pins_available.get('RF_STOP'):
+                # Сброс сессии на Arduino при старте Pi (отладка / рестарт сервиса)
+                log_act("STOP", "setup", "reset")
+                do_stop("setup")
+                global state_starting, state_playing, state_waiting
+                state_starting, state_playing, state_waiting = True, False, False
             log_ready()
     except Exception as e:
-        print(f"ERROR: GPIO initialization failed: {e}")
+        app_main.log(f"ERROR: GPIO initialization failed: {e}")
         teardown_gpio()
 
 
@@ -914,16 +938,16 @@ def loop(queue_main = None):
                     and b_stop is not None
                 ):
                     if b_increase.isClicked():
-                        log_button(RF_PIN_NAMES[RF_INCREASE])
+                        log_act("INCREASE", "radio", f"+{time_step}")
                         action(RF_INCREASE)
                     elif b_playpause.isClicked():
-                        log_button(RF_PIN_NAMES[RF_PLAYPAUSE])
+                        log_act("PLAYPAUSE", "radio")
                         action(RF_PLAYPAUSE)
                     elif b_stop.isClicked():
-                        log_button(RF_PIN_NAMES[RF_STOP])
+                        log_act("STOP", "radio", "reset")
                         action(RF_STOP)
                 elif not _gpio_unavailable_warned:
-                    print("WARNING: GPIO inputs unavailable, radio buttons disabled (API still works)")
+                    app_main.log("WARNING: GPIO inputs unavailable, radio buttons disabled (API still works)")
                     _gpio_unavailable_warned = True
             try:
                 if queue_main is not None:
@@ -957,34 +981,43 @@ def action(signal):
         elif signal == RF_STOP:
             do_stop("radio")
     elif isinstance(signal, str):
+        if signal is None or signal == "" or signal == "None":
+            return
         if signal == 'INCREASE':
+            log_act("INCREASE", "api", f"+{time_step}")
             do_increase("api")
         elif signal == 'PLAYPAUSE':
+            log_act("PLAYPAUSE", "api")
             do_playpause("api")
         elif signal == 'STOP':
+            log_act("STOP", "api", "reset")
             do_stop("api")
         elif 'ADD' in signal:
-            log_button(f'ADD {signal}', 'api')
-            increase_count = int(int(signal.split('_')[1]) / 5)
+            minutes = int(signal.split('_')[1])
+            increase_count = int(minutes / 5)
+            from_state = machine_state_label()
 
-            def increase_clicks(increase_reduce: int = 0):
-                for _ in range(increase_count - increase_reduce):
+            def increase_clicks():
+                for _ in range(increase_count):
                     do_increase("api")
                     time.sleep(1)
 
             if state_starting:
+                log_act(signal, "api", f"+{minutes} then PLAY", from_state)
                 time.sleep(5)
                 increase_clicks()
+                log_state("STARTING")
                 do_playpause("api")
             elif state_playing:
+                log_act(signal, "api", f"+{minutes}", from_state)
                 increase_clicks()
             elif state_waiting:
-                do_playpause("api")
-                time.sleep(1)
-                increase_clicks(1)
+                log_act(signal, "api", f"+{minutes} then PLAY", from_state)
+                increase_clicks()
                 do_playpause("api")
             else:
-                print("STATE: ERROR")
+                log_act(signal, "api", "skip", from_state)
+                log_state("ERROR")
 
 
 def update_state_from_relays():
@@ -999,7 +1032,7 @@ def update_state_from_relays():
         playpause_state = lgpio.gpio_read(h, R_PLAYPAUSE)
         stop_state = lgpio.gpio_read(h, R_STOP)
     except Exception as e:
-        print(f"WARNING: Error reading relay state GPIO: {e}")
+        app_main.log(f"WARNING: Error reading relay state GPIO: {e}")
         return
 
     if isRelayLow:
@@ -1010,22 +1043,23 @@ def update_state_from_relays():
     # Нажаты все кнопки? : Реле не подключено
     if buttons_state and playpause_state and stop_state:
         if state_starting or state_playing or state_waiting:
-            print("STATE: ERROR")
+            log_state("ERROR")
         state_starting = False
         state_playing = False
         state_waiting = False
     elif not state_starting and stop_state:
-        print("STATE: STARTING")
+        # После STOP — простой / сброс (не «старт сессии»)
+        log_state("STOPPING")
         state_starting = True
         state_playing = False
         state_waiting = False
     elif not state_playing and not buttons_state and playpause_state:
-        print("STATE: PLAYING")
+        log_state("PLAYING")
         state_starting = False
         state_playing = True
         state_waiting = False
     elif not state_waiting and buttons_state and playpause_state:
-        print("STATE: WAITING")
+        log_state("WAITING")
         state_starting = False
         state_playing = False
         state_waiting = True
@@ -1039,12 +1073,12 @@ def update_state_radio_watchdog():
     try:
         if lgpio.gpio_read(h, RF_INCREASE) and lgpio.gpio_read(h, RF_PLAYPAUSE) and lgpio.gpio_read(h, RF_STOP):
             if not relay_disconnected_warned:
-                print("WARNING: Radio signals look invalid (all HIGH)")
+                app_main.log("WARNING: Radio signals look invalid (all HIGH)")
                 relay_disconnected_warned = True
             return
         relay_disconnected_warned = False
     except Exception as e:
-        print(f"WARNING: Error reading GPIO: {e}")
+        app_main.log(f"WARNING: Error reading GPIO: {e}")
 
 
 def updateState():

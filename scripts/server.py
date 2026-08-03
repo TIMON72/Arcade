@@ -2,14 +2,14 @@ import asyncio
 import os
 import sys
 import signal
-import socket
 from aiohttp import web
-
 
 
 SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(SCRIPTS_DIR)
 sys.path.insert(0, SCRIPTS_DIR)
+import main as app_main
+
 routes = web.RouteTableDef()
 
 
@@ -35,8 +35,8 @@ async def index(request: web.Request):
 async def test(request: web.Request):
     response = request.query.get('action')
     queue_main = request.app['queue_main']
-    queue_main.put(response)
-    print(f"SERVER get action={response}")
+    if response:
+        queue_main.put(response)
     return web.json_response({'action': response})
 
 
@@ -67,7 +67,7 @@ async def server_start(queue_main, host, port, retry_count=0, max_retries=3):
         
         # Запуск сервера
         await server.start()
-        print(f"WEB_SERVER IS STARTED on {host}:{port}")
+        app_main.log(f"WEB_SERVER started on {host}:{port}")
         
         # Ждём бесконечно (пока не придёт сигнал завершения)
         while True:
@@ -76,24 +76,24 @@ async def server_start(queue_main, host, port, retry_count=0, max_retries=3):
     except OSError as e:
         if e.errno == 98 and retry_count < max_retries:  # Address already in use
             retry_count += 1
-            print(f"ERROR: Port {port} is already in use (attempt {retry_count}/{max_retries})")
-            print("Killing any lingering processes on this port...")
+            app_main.log(f"ERROR: Port {port} is already in use (attempt {retry_count}/{max_retries})")
+            app_main.log("Killing any lingering processes on this port...")
             os.system(f"fuser -k {port}/tcp 2>/dev/null || true")
-            print(f"Retrying in 5 seconds...")
+            app_main.log("Retrying in 5 seconds...")
             await asyncio.sleep(5)
             # Рекурсивный вызов для retry
             await server_start(queue_main, host, port, retry_count, max_retries)
         else:
-            print(f"ERROR: Cannot bind to port {port}: {e}")
+            app_main.log(f"ERROR: Cannot bind to port {port}: {e}")
             raise e
     except Exception as ex:
-        print(f"ERROR in server: {ex}")
+        app_main.log(f"ERROR in server: {ex}")
         raise ex
     finally:
         if runner is not None:
-            print("Cleaning up server resources...")
+            app_main.log("Cleaning up server resources...")
             await runner.cleanup()
-            print("Server cleanup completed")
+            app_main.log("Server cleanup completed")
 
 
 # Запуск сервера (синхронно -> асинхронно)
@@ -103,41 +103,36 @@ def server_start_async(queue_main=None, host="0.0.0.0", port=5000):
     """
     def signal_handler(signum, frame):
         """Обработчик сигналов для graceful shutdown"""
-        print(f"\nReceived signal {signum}, shutting down gracefully...")
-        # Отправляем сигнал завершения в event loop
+        app_main.log(f"Received signal {signum}, shutting down gracefully...")
         for task in asyncio.all_tasks():
             task.cancel()
     
-    # Регистрируем обработчики сигналов
     signal.signal(signal.SIGTERM, signal_handler)
     signal.signal(signal.SIGINT, signal_handler)
     
     loop = None
     try:
-        # Создаём new event loop для безопасности в multiprocessing
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-
-        # Запускаем сервер
         loop.run_until_complete(server_start(queue_main, host, port))
 
     except KeyboardInterrupt:
-        print("\nWEB_SERVER IS STOPPED (KeyboardInterrupt)")
+        app_main.log("WEB_SERVER stopped (KeyboardInterrupt)")
     except asyncio.CancelledError:
-        print("\nWEB_SERVER IS STOPPED (Cancelled)")
+        app_main.log("WEB_SERVER stopped (Cancelled)")
     except Exception as ex:
-        print(f"WEB_SERVER ERROR: {ex}")
+        app_main.log(f"WEB_SERVER ERROR: {ex}")
     finally:
         if loop is not None:
-            print("Closing event loop...")
+            app_main.log("Closing event loop...")
             loop.close()
-            print("WEB_SERVER: All resources released")
+            app_main.log("WEB_SERVER: All resources released")
 
 
 if __name__ == "__main__":
     try:
         server_start_async()
     except KeyboardInterrupt:
-        print("\nWEB_SERVER IS STOPPED")
+        app_main.log("WEB_SERVER stopped")
     except Exception as ex:
-        print(ex)
+        app_main.log(str(ex))

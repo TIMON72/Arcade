@@ -3,7 +3,7 @@ port = 5000
 
 [timer]
 # Режим: Raspberry (Pi — хозяин реле/таймера) или Arduino (Pi имитирует радио → Arduino)
-timer_mode = "Raspberry"
+timer_mode = "Arduino"
 
 # Шаг увеличения времени кнопкой "+" (минуты)
 time_step = 5
