@@ -117,13 +117,13 @@ class TerminalCashless:
         """Один стабильный импульс (замыкание контакта) — как в Arduino."""
         global hours, minutes, seconds, activated
 
-        print("TERM_OUT_CASHLESS CLOSED")
+        finish_timer_line()
+        app_main.log("TERM_OUT_CASHLESS: pulse")
+
         if is_arduino_mode():
-            # Мост: каждый импульс = клик «+» на радиовыходе к Arduino
+            # В WAITING Increase до Play глотается — шлём пакетом в batch
             self._pulse_count += 1
             self._start_pending = True
-            log_button("TERM_CASHLESS", "terminal")
-            do_increase("terminal")
             return
 
         if waited:
@@ -134,7 +134,6 @@ class TerminalCashless:
                 hours = time_main[0]
                 minutes = time_main[1]
                 seconds = time_main[2]
-                print("TERM_OUT_CASHLESS waiter: payment started")
             self._pulse_count += 1
             self._start_pending = True
             if hours < time_max:
@@ -146,27 +145,22 @@ class TerminalCashless:
             tick_timer.refresh()
             log_time()
             sync_state_flags()
-            log_timer_state("cashless waiter pulse")
         else:
             self._pulse_count += 1
             self._start_pending = True
-            log_button("TERM_CASHLESS", "terminal")
             do_increase("terminal")
-            log_timer_state("cashless pulse")
+            sync_state_flags()
 
     def _on_batch_complete(self):
         """Серия импульсов закончилась — автозапуск / возобновление."""
         global start, activated, waited
 
-        print(f"TERM_OUT_CASHLESS batch complete: pulses={self._pulse_count}")
+        pulses = self._pulse_count
         self._pulse_count = 0
 
         if is_arduino_mode():
-            if state_playing:
-                print("TERM_OUT_CASHLESS action: timer already running, time added only")
-            else:
-                print("TERM_OUT_CASHLESS action: start/resume via RF → Arduino")
-                do_playpause("terminal")
+            if pulses > 0:
+                arduino_pay(pulses)
             return
 
         if self._restart_from_waiter and not is_timer_empty():
@@ -175,20 +169,11 @@ class TerminalCashless:
             activated = False
             waited = False
             sync_state_flags()
-            print("TERM_OUT_CASHLESS action: restart from waiter")
-            log_button("TERM_CASHLESS PLAY", "terminal")
             do_playpause("terminal")
             tick_timer.refresh()
-            log_timer_state("cashless waiter restart")
         elif not activated and not waited and not is_timer_empty():
-            print("TERM_OUT_CASHLESS action: start/resume")
-            log_button("TERM_CASHLESS PLAY", "terminal")
             do_playpause("terminal")
             tick_timer.refresh()
-            log_timer_state("cashless start/resume")
-        elif activated:
-            print("TERM_OUT_CASHLESS action: timer already running, time added only")
-            log_timer_state("cashless running")
 
     def process(self):
         if not self._initialized or self._h is None:
@@ -223,8 +208,6 @@ class TerminalCashless:
                 self._on_pulse_closed()
             else:
                 self._last_contact_opened_at = now
-                duration_ms = int((now - self._contact_closed_at) * 1000)
-                print(f"TERM_OUT_CASHLESS OPEN: duration={duration_ms} ms")
 
         if (
             self._start_pending
@@ -305,6 +288,7 @@ isRelayHigh = not isRelayLow
 state_starting = True
 state_playing = False
 state_waiting = False
+state_paused = False
 # Как start / activated / waited в Arduino
 start = False
 activated = False
@@ -320,10 +304,16 @@ time_wait = app_main.timer_config.time_wait
 time_reset = app_main.timer_config.time_reset
 
 _matrix_ready = False
-# Однократное предупреждение о неподключенном реле
 relay_disconnected_warned = False
 _last_logged_state = None
 _timer_line_active = False
+
+# Arduino: глух на «КОНЕЦ» / matrixPrintStart (~5с) — копим оплату
+arduino_busy_until = 0.0
+pending_plus = 0
+pending_play = False
+# Наш последний RF PLAYPAUSE — отличить PAUSE от WAITING по тем же реле
+rf_playpause_sent_at = 0.0
 
 RF_PIN_NAMES = {
     RF_INCREASE: 'INCREASE (+)',
@@ -473,18 +463,15 @@ def show_timer_inline():
 
 
 def machine_state_label():
-    """Текущее логическое состояние для ACT [from …]."""
     if state_waiting:
         return "WAITING"
+    if state_paused:
+        return "PAUSE"
     if state_playing:
         return "PLAYING"
     if state_starting:
         return "STARTING"
     return "UNKNOWN"
-
-
-def timer_state_name():
-    return machine_state_label()
 
 
 def log_state(name, reason=""):
@@ -500,7 +487,7 @@ def log_state(name, reason=""):
 
 
 def log_timer_state(reason=""):
-    log_state(timer_state_name(), reason)
+    log_state(machine_state_label(), reason)
 
 
 def log_ready():
@@ -531,16 +518,25 @@ def is_timer_empty():
     return hours == 0 and minutes == 0 and seconds == 0
 
 
+def set_machine_state(name=None, starting=False, playing=False, waiting=False, paused=False):
+    global state_starting, state_playing, state_waiting, state_paused
+    state_starting = starting
+    state_playing = playing
+    state_waiting = waiting
+    state_paused = paused
+    if name:
+        log_state(name)
+
+
 def sync_state_flags():
-    global state_starting, state_playing, state_waiting
     if not start:
-        state_starting, state_playing, state_waiting = True, False, False
+        set_machine_state(starting=True)
     elif waited:
-        state_starting, state_playing, state_waiting = False, False, True
+        set_machine_state(waiting=True)
     elif activated:
-        state_starting, state_playing, state_waiting = False, True, False
+        set_machine_state(playing=True)
     else:
-        state_starting, state_playing, state_waiting = False, False, False
+        set_machine_state(paused=True)
 
 
 def _console_start_countdown():
@@ -675,7 +671,7 @@ def relay_click(relay: int):
 
 
 def rf_click(rf_pin: int):
-    """Имитация нажатия радиокнопки (выход HIGH ~1 с) — режим Arduino / init."""
+    """Имитация нажатия радиокнопки (выход HIGH ~1 с) — режим Arduino."""
     if h is None:
         app_main.log(f"RF: skip click pin={rf_pin} (GPIO not open)")
         return
@@ -683,29 +679,106 @@ def rf_click(rf_pin: int):
     if pin_name and not gpio_pins_available.get(pin_name):
         app_main.log(f"RF: skip click {pin_name}({rf_pin}) (not available)")
         return
-    label = RF_PIN_NAMES.get(rf_pin, str(rf_pin))
-    # Короткие имена для лога: INCREASE / PLAYPAUSE / STOP
-    short = {
-        RF_INCREASE: "INCREASE",
-        RF_PLAYPAUSE: "PLAYPAUSE",
-        RF_STOP: "STOP",
-    }.get(rf_pin, label)
+    short = {RF_INCREASE: "INCREASE", RF_PLAYPAUSE: "PLAYPAUSE", RF_STOP: "STOP"}.get(
+        rf_pin, RF_PIN_NAMES.get(rf_pin, str(rf_pin))
+    )
     finish_timer_line()
-    app_main.log(f"RF: {short}({rf_pin}) pulse")
+    app_main.log(f"RF: {short}({rf_pin}) clicked")
     lgpio.gpio_write(h, rf_pin, 1)
     time.sleep(1)
     lgpio.gpio_write(h, rf_pin, 0)
 
 
+def arduino_busy():
+    return time.monotonic() < arduino_busy_until
+
+
+def arduino_hold(sec=6.0):
+    """Arduino глух ~5с на «КОНЕЦ» / matrixPrintStart — копим оплату."""
+    global arduino_busy_until
+    arduino_busy_until = time.monotonic() + sec
+
+
+def rf_burst(pin, count, gap=0.3):
+    for _ in range(max(0, count)):
+        rf_click(pin)
+        time.sleep(gap)
+
+
+def arduino_pay(steps):
+    """Оплата → RF. 1 шаг = 1 импульс / +5 мин на Arduino (конфиг там).
+
+    WAITING: Play (1 шаг) → Increase×(N-1) → Play.
+    PLAYING/PAUSE: Increase×N.
+    Иначе: Increase×N → Play.
+    """
+    global pending_plus, pending_play
+    if steps <= 0:
+        return
+    if arduino_busy():
+        pending_plus += steps
+        if state_starting:
+            pending_play = True
+        app_main.log(f"ACT: +{steps * 5} queued (Arduino busy)")
+        return
+    if state_waiting and not state_paused:
+        rf_click(RF_PLAYPAUSE)
+        time.sleep(0.3)
+        rf_burst(RF_INCREASE, steps - 1)
+        rf_click(RF_PLAYPAUSE)
+        arduino_hold()
+    elif state_playing or state_paused:
+        rf_burst(RF_INCREASE, steps)
+    else:
+        rf_burst(RF_INCREASE, steps)
+        rf_click(RF_PLAYPAUSE)
+        arduino_hold()
+
+
+def flush_arduino():
+    """Сбросить накопленные + / Play после глухого окна."""
+    global pending_plus, pending_play
+    if arduino_busy():
+        return
+    n, play = pending_plus, pending_play
+    if n <= 0 and not play:
+        return
+    pending_plus = 0
+    pending_play = False
+    if n > 0:
+        app_main.log(f"ACT: flush +{n * 5} min")
+    rf_burst(RF_INCREASE, n, gap=0.2)
+    if play:
+        rf_click(RF_PLAYPAUSE)
+        arduino_hold()
+
+
 def do_increase(source="api"):
+    global pending_plus
     if is_arduino_mode():
-        rf_click(RF_INCREASE)
+        if arduino_busy():
+            pending_plus += 1
+        else:
+            rf_click(RF_INCREASE)
     else:
         handle_increase(source)
 
 
 def do_playpause(source="api"):
+    global pending_play, rf_playpause_sent_at, state_paused, state_playing
     if is_arduino_mode():
+        if arduino_busy():
+            pending_play = True
+            return
+        # Play в PLAYING → PAUSE (реле как у WAITING)
+        if state_playing and not state_waiting and not state_paused:
+            state_paused = True
+            log_state("PAUSE")
+        elif state_paused:
+            state_paused = False
+            state_playing = True
+            log_state("PLAYING")
+        rf_playpause_sent_at = time.monotonic()
         rf_click(RF_PLAYPAUSE)
     else:
         handle_playpause(source)
@@ -714,6 +787,7 @@ def do_playpause(source="api"):
 def do_stop(source="api"):
     if is_arduino_mode():
         rf_click(RF_STOP)
+        arduino_hold()
     else:
         handle_stop(source)
 
@@ -912,8 +986,7 @@ def setup():
                 # Сброс сессии на Arduino при старте Pi (отладка / рестарт сервиса)
                 log_act("STOP", "setup", "reset")
                 do_stop("setup")
-                global state_starting, state_playing, state_waiting
-                state_starting, state_playing, state_waiting = True, False, False
+                set_machine_state(starting=True)
             log_ready()
     except Exception as e:
         app_main.log(f"ERROR: GPIO initialization failed: {e}")
@@ -928,6 +1001,8 @@ def loop(queue_main = None):
     try:
         while True:
             updateState()
+            if is_arduino_mode():
+                flush_arduino()
             if terminal_cashless is not None:
                 terminal_cashless.process()
             if is_raspberry_mode():
@@ -972,7 +1047,7 @@ def test():
 
 # Действие: радио (int RF_*) или сервер (str INCREASE/PLAYPAUSE/STOP/ADD_*)
 def action(signal):
-    global state_starting, state_playing, state_waiting
+    global pending_plus
     if isinstance(signal, int):
         if signal == RF_INCREASE:
             do_increase("radio")
@@ -997,32 +1072,42 @@ def action(signal):
             increase_count = int(minutes / 5)
             from_state = machine_state_label()
 
-            def increase_clicks():
-                for _ in range(increase_count):
+            def increase_clicks(reduce=0):
+                for _ in range(increase_count - reduce):
                     do_increase("api")
                     time.sleep(1)
 
             if state_starting:
                 log_act(signal, "api", f"+{minutes} then PLAY", from_state)
-                time.sleep(5)
                 increase_clicks()
-                log_state("STARTING")
                 do_playpause("api")
-            elif state_playing:
+                if is_arduino_mode():
+                    arduino_hold()
+            elif state_paused or state_playing:
                 log_act(signal, "api", f"+{minutes}", from_state)
                 increase_clicks()
             elif state_waiting:
-                log_act(signal, "api", f"+{minutes} then PLAY", from_state)
-                increase_clicks()
-                do_playpause("api")
+                if is_arduino_mode():
+                    # Повторный ADD на старте — копим, без второго Play
+                    if arduino_busy():
+                        pending_plus += increase_count
+                        log_act(signal, "api", f"+{minutes} queued", from_state)
+                    else:
+                        # Как init: Play → +(N-1) → Play
+                        log_act(signal, "api", f"PLAY +{minutes} PLAY", from_state)
+                        arduino_pay(increase_count)
+                else:
+                    log_act(signal, "api", f"+{minutes} then PLAY", from_state)
+                    increase_clicks()
+                    do_playpause("api")
             else:
                 log_act(signal, "api", "skip", from_state)
                 log_state("ERROR")
 
 
 def update_state_from_relays():
-    """Режим Arduino: состояния по входам R_* (как updateState в init)."""
-    global state_starting, state_playing, state_waiting
+    """Режим Arduino: состояния по входам R_*."""
+    global state_paused, state_waiting
     if h is None:
         return
     if not all(gpio_pins_available.get(name, False) for name in ('R_BUTTONS', 'R_PLAYPAUSE', 'R_STOP')):
@@ -1040,29 +1125,27 @@ def update_state_from_relays():
         playpause_state = not playpause_state
         stop_state = not stop_state
 
-    # Нажаты все кнопки? : Реле не подключено
+    # Все «активны» → реле не подключено
     if buttons_state and playpause_state and stop_state:
-        if state_starting or state_playing or state_waiting:
-            log_state("ERROR")
-        state_starting = False
-        state_playing = False
-        state_waiting = False
+        if state_starting or state_playing or state_waiting or state_paused:
+            set_machine_state("ERROR")
+        else:
+            set_machine_state()
     elif not state_starting and stop_state:
-        # После STOP — простой / сброс (не «старт сессии»)
-        log_state("STOPPING")
-        state_starting = True
-        state_playing = False
-        state_waiting = False
-    elif not state_playing and not buttons_state and playpause_state:
-        log_state("PLAYING")
-        state_starting = False
-        state_playing = True
-        state_waiting = False
+        set_machine_state("STOPPING", starting=True)
+        arduino_hold()  # «КОНЕЦ» даже если STOP не от Pi
+    elif not state_playing and not state_paused and not buttons_state and playpause_state:
+        set_machine_state("PLAYING", playing=True)
+    elif state_paused:
+        pass  # реле как у WAITING — не перетирать
     elif not state_waiting and buttons_state and playpause_state:
-        log_state("WAITING")
-        state_starting = False
-        state_playing = False
-        state_waiting = True
+        # Тот же паттерн, что пауза: наш Play из PLAYING → PAUSE, иначе WAITING
+        if state_playing and (time.monotonic() - rf_playpause_sent_at) < 2.5:
+            state_paused = True
+            state_waiting = False
+            log_state("PAUSE")
+        else:
+            set_machine_state("WAITING", waiting=True)
 
 
 def update_state_radio_watchdog():
