@@ -3,11 +3,35 @@
 enabled = true
 # CEC logical address телевизора (обычно 0)
 device = 0
+# Имя устройства на шине CEC (вместо дефолтного CECTester)
+osd_name = "Arcade"
+# Physical address CEC: auto = из scan / по порту (A-1→1.0.0.0, A-2→2.0.0.0)
+physical_address = "auto"
+# DRM-выход: auto = HDMI-A-1 или HDMI-A-2 (что connected); либо "HDMI-A-1,HDMI-A-2"
+hdmi_output = "auto"
 # Пауза перед первой попыткой (Pi часто встаёт раньше ТВ)
 initial_delay_sec = 10
-# Пауза между попытками
+# Пауза между попытками включения
 interval_sec = 5
-# Сколько всего ждать ТВ (сек)
+# Сколько всего ждать power=on (сек)
 max_wait_sec = 180
+# Сколько ждать DRM HDMI connected после power=on
+hdmi_wait_sec = 60
+# Пауза после power=on/HDMI перед claim (ТВ ещё «просыпается»)
+settle_sec = 15
+# Повторы claim-сессии (as + Image View On + Active Source)
+claim_retries = 3
+claim_interval_sec = 3
+# Сколько держать cec-client открытым после as (иначе Active Source сбрасывается)
+claim_hold_sec = 12
+# После CEC — batocera-resolution setOutput (чинит чёрный экран после boot без ТВ)
+refresh_display = true
+# Перезапуск PipeWire/audioconfig (иначе после позднего HDMI остаётся Dummy/нет звука)
+refresh_audio = true
+# Перезапуск EmulationStation после video+audio (ES мог стартовать без экрана/звука)
+restart_es = true
+# Повторы setOutput, пока labwc/Wayland не готовы
+display_retries = 5
+display_retry_sec = 3
 # Уровень отладки cec-client (-d)
 cec_debug = 1

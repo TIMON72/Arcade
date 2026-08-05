@@ -841,6 +841,10 @@ def _venv_python() -> str:
     return os.path.join(_VENV_DIR, "bin", "python")
 
 
+def _venv_is_usable() -> bool:
+    return os.path.isfile(_venv_python())
+
+
 def _deps_installed(python_path: str | None = None) -> bool:
     python = python_path or _venv_python()
     if not os.path.isfile(python):
@@ -870,9 +874,20 @@ def _reexec_into_runtime() -> None:
     os.execv(venv_python, [venv_python, main_script, *sys.argv[1:]])
 
 
-def _install_dependencies() -> bool:
+def _pip_cmd() -> list[str] | None:
+    """Команда pip: bin/pip или python -m pip."""
     pip_path = _venv_pip()
-    if not os.path.isfile(pip_path):
+    if os.path.isfile(pip_path):
+        return [pip_path]
+    python = _venv_python()
+    if os.path.isfile(python):
+        return [python, "-m", "pip"]
+    return None
+
+
+def _install_dependencies() -> bool:
+    pip_cmd = _pip_cmd()
+    if not pip_cmd:
         print("✗ ERROR: pip not found in venv")
         return False
 
@@ -884,7 +899,7 @@ def _install_dependencies() -> bool:
     if wheels:
         print(f"Installing {_LUMA_PACKAGE} from {len(wheels)} local wheels (offline)...")
         cmd = [
-            pip_path,
+            *pip_cmd,
             "install",
             "--no-index",
             f"--find-links={_WHEELS_DIR}",
@@ -892,7 +907,7 @@ def _install_dependencies() -> bool:
         ]
     else:
         print(f"⚠ wheels/ not found — trying pip over the network ({_LUMA_PACKAGE})...")
-        cmd = [pip_path, "install", _LUMA_PACKAGE]
+        cmd = [*pip_cmd, "install", _LUMA_PACKAGE]
 
     result = subprocess.run(cmd)
     if result.returncode == 0:
@@ -952,6 +967,15 @@ def setup_venv():
         os.rename(legacy, preferred)
     _VENV_DIR = _resolve_venv_dir()
 
+    # Обломок .venv (например только lib64) блокировал create — пересоздаём
+    if os.path.isdir(_VENV_DIR) and not _venv_is_usable():
+        print(f"⚠ Broken virtualenv at {_VENV_DIR} — recreating...")
+        try:
+            shutil.rmtree(_VENV_DIR)
+        except OSError as error:
+            print(f"✗ ERROR: Cannot remove broken venv: {error}")
+            sys.exit(1)
+
     venv_python = _venv_python()
     if os.path.isdir(_VENV_DIR) and _deps_installed(venv_python):
         _link_workspace_venv()
@@ -965,10 +989,25 @@ def setup_venv():
             venv_module.create(_VENV_DIR, with_pip=True, system_site_packages=True)
             print(f"✓ Virtual environment created: {_VENV_DIR}")
         except Exception as error:
-            print(f"✗ ERROR: Failed to create venv: {error}")
-            sys.exit(1)
+            print(f"⚠ venv with_pip failed ({error}), retry without pip...")
+            try:
+                if os.path.isdir(_VENV_DIR):
+                    shutil.rmtree(_VENV_DIR)
+                venv_module.create(_VENV_DIR, with_pip=False, system_site_packages=True)
+                subprocess.run(
+                    [_venv_python(), "-m", "ensurepip", "--upgrade"],
+                    check=False,
+                )
+                print(f"✓ Virtual environment created: {_VENV_DIR}")
+            except Exception as error2:
+                print(f"✗ ERROR: Failed to create venv: {error2}")
+                sys.exit(1)
 
-    if not _deps_installed(venv_python):
+    if not _venv_is_usable():
+        print(f"✗ ERROR: venv python missing at {_venv_python()}")
+        sys.exit(1)
+
+    if not _deps_installed(_venv_python()):
         if not _install_dependencies():
             sys.exit(1)
 
