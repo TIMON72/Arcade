@@ -1,7 +1,8 @@
 #!/bin/bash
 
 ROOT="/userdata/system/scripts"
-SCRIPT="$ROOT/main.py"
+SCRIPT="$ROOT/main/main.py"
+ARCADE="/userdata/system/Arcade"
 PIDFILE="/var/run/main-service.pid"
 LOG="/userdata/system/logs/main-service.log"
 PYTHON="$ROOT/.venv/bin/python"
@@ -31,8 +32,30 @@ ensure_git_links() {
     fi
 }
 
+# Если рабочей копии ещё нет — один раз задеплоить из /userdata/system/Arcade
+bootstrap_from_arcade() {
+    if [ -f "$SCRIPT" ]; then
+        return 0
+    fi
+    if [ ! -f "$ARCADE/scripts/main/main.py" ]; then
+        echo "main: missing $SCRIPT and $ARCADE — run Arcade/install" >&2
+        return 1
+    fi
+    mkdir -p "$(dirname "$LOG")"
+    echo "main: bootstrapping deploy from $ARCADE ..."
+    python3 "$ARCADE/scripts/main/main.py" deploy >>"$LOG" 2>&1 || return 1
+    PYTHON="$ROOT/.venv/bin/python"
+    [ -x "$PYTHON" ] || PYTHON="$ROOT/venv/bin/python"
+    [ -x "$PYTHON" ] || PYTHON="python3"
+}
+
 start() {
     ensure_git_links
+    bootstrap_from_arcade || true
+    if [ ! -f "$SCRIPT" ]; then
+        echo "main: cannot start — $SCRIPT not found (place Arcade and run ./install)" >&2
+        return 1
+    fi
     if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
         echo "main is already running (PID $(cat "$PIDFILE"))"
         return 0
@@ -58,10 +81,10 @@ stop() {
         rm -f "$PIDFILE"
     fi
     pkill -TERM -f "$SCRIPT" 2>/dev/null
-    pkill -TERM -f "$ROOT/main.py" 2>/dev/null
+    pkill -TERM -f "$ROOT/main/main.py" 2>/dev/null
     sleep 0.2
     pkill -KILL -f "$SCRIPT" 2>/dev/null
-    pkill -KILL -f "$ROOT/main.py" 2>/dev/null
+    pkill -KILL -f "$ROOT/main/main.py" 2>/dev/null
     echo "OK"
 }
 status() {

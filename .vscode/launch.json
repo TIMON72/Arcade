@@ -5,41 +5,53 @@
             "name": "Main",
             "type": "debugpy",
             "request": "launch",
-            "program": "${workspaceFolder}/scripts/main.py",
+            "program": "${workspaceFolder}/scripts/main/main.py",
             "python": "${workspaceFolder}/.venv/bin/python",
-            "console": "integratedTerminal",
-            "subProcess": true,
+            "console": "internalConsole",
+            "internalConsoleOptions": "openOnSessionStart",
             "justMyCode": true,
-            "preLaunchTask": "stop-main-service"
-        },
-        {
-            "name": "Server",
-            "type": "debugpy",
-            "request": "launch",
-            "program": "${workspaceFolder}/scripts/server.py",
-            "python": "${workspaceFolder}/.venv/bin/python",
-            "console": "integratedTerminal",
             "preLaunchTask": "stop-main-service"
         },
         {
             "name": "Timer",
             "type": "debugpy",
             "request": "launch",
-            "program": "${workspaceFolder}/scripts/timer.py",
+            "program": "${workspaceFolder}/scripts/timer/timer.py",
             "python": "${workspaceFolder}/.venv/bin/python",
-            "console": "integratedTerminal",
-            "preLaunchTask": "stop-main-service"
+            "console": "internalConsole",
+            "internalConsoleOptions": "openOnSessionStart",
+            "preLaunchTask": "stop-timer-service"
+        },
+        {
+            "name": "Server",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/scripts/server/server.py",
+            "python": "${workspaceFolder}/.venv/bin/python",
+            "console": "internalConsole",
+            "internalConsoleOptions": "openOnSessionStart",
+            "preLaunchTask": "stop-server-service"
+        },
+        {
+            "name": "Tvon",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/scripts/tvon/tvon.py",
+            "python": "${workspaceFolder}/.venv/bin/python",
+            "console": "internalConsole",
+            "internalConsoleOptions": "openOnSessionStart",
+            "preLaunchTask": "stop-tvon-service"
         }
     ],
     "compounds": [
         {
-            "name": "All",
-            "configurations": [
-                "Server",
-                "Timer"
-            ],
+            "name": "Arcade",
+            "configurations": ["Main", "Timer", "Server"],
+            "preLaunchTask": "stop-arcade-services",
             "stopAll": true,
-            "preLaunchTask": "stop-main-service"
+            "presentation": {
+                "order": 1
+            }
         }
     ]
 }

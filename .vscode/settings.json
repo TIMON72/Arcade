@@ -2,6 +2,10 @@
     "python.defaultInterpreterPath": "${workspaceFolder}/.venv/bin/python",
     "python.analysis.extraPaths": [
         "${workspaceFolder}/scripts",
+        "${workspaceFolder}/scripts/main",
+        "${workspaceFolder}/scripts/timer",
+        "${workspaceFolder}/scripts/server",
+        "${workspaceFolder}/scripts/tvon",
         "/usr/lib/python3.12/site-packages"
     ],
     "files.eol": "\n",

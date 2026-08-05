@@ -2,23 +2,59 @@
     "version": "2.0.0",
     "tasks": [
         {
+            "label": "stop-arcade-services",
+            "type": "shell",
+            "command": "batocera-services stop main timer server >/dev/null 2>&1 || true; echo stop-arcade-services: done",
+            "options": {
+                "cwd": "${workspaceFolder}",
+                "shell": { "executable": "/bin/bash", "args": ["-lc"] }
+            },
+            "problemMatcher": [],
+            "presentation": { "reveal": "silent", "panel": "shared", "showReuseMessage": false, "close": true }
+        },
+        {
             "label": "stop-main-service",
             "type": "shell",
             "command": "batocera-services stop main >/dev/null 2>&1 || true; echo stop-main-service: done",
             "options": {
                 "cwd": "${workspaceFolder}",
-                "shell": {
-                    "executable": "/bin/bash",
-                    "args": ["-lc"]
-                }
+                "shell": { "executable": "/bin/bash", "args": ["-lc"] }
             },
             "problemMatcher": [],
-            "presentation": {
-                "reveal": "silent",
-                "panel": "shared",
-                "showReuseMessage": false,
-                "close": true
-            }
+            "presentation": { "reveal": "silent", "panel": "shared", "showReuseMessage": false, "close": true }
+        },
+        {
+            "label": "stop-timer-service",
+            "type": "shell",
+            "command": "batocera-services stop timer >/dev/null 2>&1 || true; echo stop-timer-service: done",
+            "options": {
+                "cwd": "${workspaceFolder}",
+                "shell": { "executable": "/bin/bash", "args": ["-lc"] }
+            },
+            "problemMatcher": [],
+            "presentation": { "reveal": "silent", "panel": "shared", "showReuseMessage": false, "close": true }
+        },
+        {
+            "label": "stop-server-service",
+            "type": "shell",
+            "command": "batocera-services stop server >/dev/null 2>&1 || true; echo stop-server-service: done",
+            "options": {
+                "cwd": "${workspaceFolder}",
+                "shell": { "executable": "/bin/bash", "args": ["-lc"] }
+            },
+            "problemMatcher": [],
+            "presentation": { "reveal": "silent", "panel": "shared", "showReuseMessage": false, "close": true }
+        },
+        {
+            "label": "stop-tvon-service",
+            "type": "shell",
+            "command": "batocera-services stop tvon >/dev/null 2>&1 || true; echo stop-tvon-service: done",
+            "options": {
+                "cwd": "${workspaceFolder}",
+                "shell": { "executable": "/bin/bash", "args": ["-lc"] }
+            },
+            "problemMatcher": [],
+            "presentation": { "reveal": "silent", "panel": "shared", "showReuseMessage": false, "close": true }
         }
     ]
 }

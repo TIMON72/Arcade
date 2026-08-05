@@ -1,0 +1,13 @@
+[tvon]
+# HDMI-CEC: автозапуск ТВ при старте Batocera
+enabled = true
+# CEC logical address телевизора (обычно 0)
+device = 0
+# Пауза перед первой попыткой (Pi часто встаёт раньше ТВ)
+initial_delay_sec = 10
+# Пауза между попытками
+interval_sec = 5
+# Сколько всего ждать ТВ (сек)
+max_wait_sec = 180
+# Уровень отладки cec-client (-d)
+cec_debug = 1

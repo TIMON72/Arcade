@@ -1,0 +1,4 @@
+[ssh]
+# Доступ к этой Batocera по SSH — читают другие сервисы через main.ssh
+user = "root"
+password = "linux"

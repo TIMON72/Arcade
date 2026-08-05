@@ -1,6 +1,3 @@
-[server]
-port = 5000
-
 [timer]
 # Режим: Raspberry (Pi — хозяин реле/таймера) или Arduino (Pi имитирует радио → Arduino)
 timer_mode = "Arduino"
@@ -13,6 +10,9 @@ time_wait = 60
 
 # Автосброс, если время выставлено, но игра не запущена (минуты)
 time_reset = 5
+
+# Unix datagram: команды от сервиса server (modules/timer.py)
+cmd_socket = "/var/run/arcade-timer.sock"
 
 [gpio]
 # Пины RF (BCM): в режиме Raspberry — входы пульта; в Arduino — выходы «имитация радио»

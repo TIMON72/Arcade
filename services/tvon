@@ -1,0 +1,84 @@
+#!/bin/bash
+# HDMI-CEC: надзиратель включения ТВ (холодный старт — Pi раньше TV)
+
+ROOT="/userdata/system/scripts"
+SCRIPT="$ROOT/tvon/tvon.py"
+PIDFILE="/var/run/tvon-service.pid"
+LOG="/userdata/system/logs/tvon-service.log"
+PYTHON="$ROOT/.venv/bin/python"
+[ -x "$PYTHON" ] || PYTHON="$ROOT/venv/bin/python"
+[ -x "$PYTHON" ] || PYTHON="python3"
+
+start() {
+    if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+        echo "tvon is already running (PID $(cat "$PIDFILE"))"
+        return 0
+    fi
+    if [ ! -f "$SCRIPT" ]; then
+        echo "tvon: script not found: $SCRIPT"
+        return 1
+    fi
+    mkdir -p "$(dirname "$LOG")"
+    echo -n "Starting tvon: "
+    # фон — бут Batocera не блокируем
+    start-stop-daemon -S -b -m -p "$PIDFILE" -x /bin/bash -- -c \
+        "exec \"$PYTHON\" \"$SCRIPT\" >> \"$LOG\" 2>&1"
+    echo "OK (app log: $ROOT/logs.log)"
+}
+
+stop() {
+    echo -n "Stopping tvon: "
+    if [ -f "$PIDFILE" ]; then
+        pid="$(cat "$PIDFILE" 2>/dev/null)"
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            kill -TERM "$pid" 2>/dev/null
+            for _ in 1 2 3 4 5; do
+                kill -0 "$pid" 2>/dev/null || break
+                sleep 0.2
+            done
+            kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null
+        fi
+        rm -f "$PIDFILE"
+    fi
+    pkill -TERM -f "$SCRIPT" 2>/dev/null
+    sleep 0.2
+    pkill -KILL -f "$SCRIPT" 2>/dev/null
+    echo "OK"
+}
+
+status() {
+    local lines="${TVON_LOG_LINES:-30}"
+    local exit_code=1
+
+    if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+        echo "tvon is running (PID $(cat "$PIDFILE"))"
+        exit_code=0
+    else
+        echo "tvon is not running"
+    fi
+
+    if [ -f "$LOG" ]; then
+        echo "--- last ${lines} lines: ${LOG} ---"
+        tail -n "$lines" "$LOG"
+    fi
+
+    local app_log="$ROOT/logs.log"
+    if [ -f "$app_log" ]; then
+        echo "--- last ${lines} lines: ${app_log} ---"
+        tail -n "$lines" "$app_log"
+    fi
+
+    return "$exit_code"
+}
+
+case "$1" in
+    start)   start ;;
+    stop)    stop ;;
+    restart) stop; sleep 1; start ;;
+    status)  status ;;
+    *)
+        echo "Usage: $0 {start|stop|restart|status}"
+        exit 1
+        ;;
+esac
+exit 0

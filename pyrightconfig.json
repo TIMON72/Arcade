@@ -7,6 +7,10 @@
       "python": "/userdata/system/scripts/.venv/bin/python",
       "extraPaths": [
         "scripts",
+        "scripts/main",
+        "scripts/timer",
+        "scripts/server",
+        "scripts/tvon",
         "/usr/lib/python3.12/site-packages",
         "/userdata/system/scripts/.venv/lib/python3.12/site-packages"
       ]

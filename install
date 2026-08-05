@@ -1,0 +1,51 @@
+#!/bin/bash
+# Однократная установка seed на Batocera.
+# Дальше: обновляете /userdata/system/Arcade и перезагружаете — main сам задеплоит.
+set -euo pipefail
+
+ARCADE="$(cd "$(dirname "$0")" && pwd)"
+SYSTEM="/userdata/system"
+TARGET="${SYSTEM}/Arcade"
+
+if [[ ! -f "${ARCADE}/batocera.conf" || ! -d "${ARCADE}/scripts" || ! -d "${ARCADE}/services" ]]; then
+    echo "ERROR: run this from the Arcade project root"
+    exit 1
+fi
+
+if [[ "$(realpath "$ARCADE")" != "$(realpath "$TARGET" 2>/dev/null || echo "")" ]]; then
+    echo "Arcade is at: ${ARCADE}"
+    echo "Expected path for auto-sync on reboot: ${TARGET}"
+    if [[ ! -e "$TARGET" ]]; then
+        echo "Creating symlink ${TARGET} -> ${ARCADE}"
+        ln -sfn "$ARCADE" "$TARGET"
+    else
+        echo "WARNING: ${TARGET} exists and is not this tree — auto-sync uses ${TARGET}"
+    fi
+fi
+
+mkdir -p "${SYSTEM}/services" "${SYSTEM}/logs"
+
+# Seed: достаточно сервиса main; при старте он задеплоит остальное из Arcade
+cp -f "${ARCADE}/services/main" "${SYSTEM}/services/main"
+# CRLF → LF + executable
+sed -i 's/\r$//' "${SYSTEM}/services/main" 2>/dev/null || true
+chmod 755 "${SYSTEM}/services/main"
+
+PYTHON="python3"
+if [[ -x "${SYSTEM}/scripts/.venv/bin/python" ]]; then
+    PYTHON="${SYSTEM}/scripts/.venv/bin/python"
+fi
+
+echo "Deploying from ${ARCADE} ..."
+"$PYTHON" "${ARCADE}/scripts/main/main.py" deploy
+
+for svc in main timer server tvon; do
+    batocera-services enable "$svc" 2>/dev/null || true
+done
+
+echo
+echo "OK. First install done."
+echo "  • Source of truth: ${TARGET}"
+echo "  • Update: git pull in Arcade (or replace the folder), then reboot"
+echo "  • Or now: batocera-services start main"
+echo

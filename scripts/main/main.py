@@ -6,8 +6,8 @@ import subprocess
 import importlib
 import multiprocessing
 import time
-import logging
 import signal
+import socket
 import tempfile
 import platform
 import gzip
@@ -24,10 +24,15 @@ venv_module = importlib.import_module("venv")
 # ВИРТУАЛЬНАЯ СРЕДА И РАЗВЁРТЫВАНИЕ НА BATOCERA
 # ============================================================================
 
-_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+# scripts/main/main.py → пакет main; общий корень scripts/ (конфиг, лог, venv)
+_MAIN_DIR = os.path.dirname(os.path.abspath(__file__))
+_SCRIPTS_ROOT = os.path.dirname(_MAIN_DIR)
+_SCRIPT_DIR = _MAIN_DIR  # каталог пакета main (server/timer/modules)
 _BATOCERA_SYSTEM_DIR = "/userdata/system"
 _DEPLOYED_SCRIPTS_DIR = os.path.join(_BATOCERA_SYSTEM_DIR, "scripts")
 _DEPLOY_MARKER = os.path.join(_BATOCERA_SYSTEM_DIR, ".arcade-deployed")
+_ARCADE_CHECKOUT = os.path.join(_BATOCERA_SYSTEM_DIR, "Arcade")
+_ARCADE_SERVICES = ("main", "timer", "server", "tvon")
 _GIT_INSTALL_DIR = os.path.join(_BATOCERA_SYSTEM_DIR, "git")
 _GIT_VENDOR_REL = os.path.join("vendor", "git")
 _GIT_LINK_NAMES = (
@@ -50,24 +55,138 @@ _GIT_DOWNLOAD_BASE = (
 )
 
 
-_CONFIG_FILENAME = "config_main.toml"
+_CONFIG_FILENAME = "config.toml"
 _LUMA_PACKAGE = "luma.led_matrix==1.9.0"
 _REQUIREMENTS_FILE_NAME = "requirements.txt"
 
+# Общий лог: на Batocera — /userdata/system/scripts/logs.log;
+# при debug из Arcade дублируем ещё в workspace scripts/logs.log.
+_LOG_CANDIDATES = []
+if os.path.isdir("/userdata/system/scripts"):
+    _LOG_CANDIDATES.append("/userdata/system/scripts/logs.log")
+_workspace_log = os.path.join(_SCRIPTS_ROOT, "logs.log")
+if _workspace_log not in _LOG_CANDIDATES:
+    _LOG_CANDIDATES.append(_workspace_log)
+LOG_FILE = _LOG_CANDIDATES[0]
+CONFIG_PATH = os.path.join(_MAIN_DIR, _CONFIG_FILENAME)
+_log_lock = threading.Lock()
+
+
+def log(message: str) -> None:
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"{stamp} - INFO - {message}"
+    with _log_lock:
+        print(line, flush=True)
+        for path in _LOG_CANDIDATES:
+            try:
+                with open(path, "a", encoding="utf-8") as log_file:
+                    log_file.write(line + "\n")
+            except OSError:
+                pass
+
+
+# ---------------------------------------------------------------------------
+# Unix datagram: общий канал команд между сервисами (server → timer, …)
+# ---------------------------------------------------------------------------
+
+class CmdListener:
+    """Неблокирующий приём строк с Unix datagram socket; poll() в цикле сервиса."""
+
+    def __init__(self, path: str):
+        self.path = path
+        self._sock = None
+
+    def setup(self) -> None:
+        directory = os.path.dirname(self.path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        if os.path.exists(self.path):
+            os.unlink(self.path)
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        sock.bind(self.path)
+        sock.setblocking(False)
+        try:
+            os.chmod(self.path, 0o666)
+        except OSError:
+            pass
+        self._sock = sock
+
+    def poll(self):
+        if self._sock is None:
+            return None
+        try:
+            data, _addr = self._sock.recvfrom(4096)
+        except BlockingIOError:
+            return None
+        except OSError:
+            return None
+        text = data.decode("utf-8", "replace").strip()
+        return text or None
+
+    def close(self) -> None:
+        if self._sock is not None:
+            try:
+                self._sock.close()
+            except OSError:
+                pass
+            self._sock = None
+        if os.path.exists(self.path):
+            try:
+                os.unlink(self.path)
+            except OSError:
+                pass
+
+
+def cmd_send(path: str, message: str) -> bool:
+    """Отправить строку на Unix datagram socket (другой сервис должен слушать)."""
+    if not message:
+        return False
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    try:
+        sock.sendto(message.encode("utf-8"), path)
+        return True
+    except OSError as e:
+        log(f"cmd_send failed ({message!r} → {path}): {e}")
+        return False
+    finally:
+        sock.close()
+
+
+@dataclass(frozen=True)
+class SshConfig:
+    user: str = "root"
+    password: str = "linux"
+
+
+def load_ssh_config() -> SshConfig:
+    defaults = SshConfig()
+    if not os.path.isfile(CONFIG_PATH):
+        return defaults
+    with open(CONFIG_PATH, "rb") as config_file:
+        data = tomllib.load(config_file)
+    section = data.get("ssh", {})
+    if not isinstance(section, dict):
+        raise ValueError("[ssh] section must be a table")
+    user = section.get("user", defaults.user)
+    password = section.get("password", defaults.password)
+    if not isinstance(user, str) or not isinstance(password, str):
+        raise ValueError("[ssh] user and password must be strings")
+    return SshConfig(user=user, password=password)
+
 
 def _find_project_root() -> str:
-    return _SCRIPT_DIR
+    return _SCRIPTS_ROOT
 
 
 def _is_deployed_scripts() -> bool:
-    return os.path.realpath(_SCRIPT_DIR) == os.path.realpath(_DEPLOYED_SCRIPTS_DIR)
+    return os.path.realpath(_SCRIPTS_ROOT) == os.path.realpath(_DEPLOYED_SCRIPTS_DIR)
 
 
 def _runtime_scripts_dir() -> str:
     """На Batocera venv и wheels всегда в /userdata/system/scripts/."""
     if _is_batocera_system():
         return _DEPLOYED_SCRIPTS_DIR
-    return _SCRIPT_DIR
+    return _SCRIPTS_ROOT
 
 
 def _resolve_wheels_dir() -> str:
@@ -99,9 +218,9 @@ def _bundle_root() -> str:
     source = _deploy_source_root()
     if source:
         return source
-    if os.path.basename(_SCRIPT_DIR) == "scripts":
-        return os.path.dirname(_SCRIPT_DIR)
-    return _SCRIPT_DIR
+    if os.path.basename(_SCRIPTS_ROOT) == "scripts":
+        return os.path.dirname(_SCRIPTS_ROOT)
+    return _SCRIPTS_ROOT
 
 
 def _requirements_file() -> str:
@@ -122,19 +241,34 @@ def _is_batocera_system() -> bool:
     )
 
 
+def _looks_like_arcade_root(path: str) -> bool:
+    if not path or not os.path.isdir(path):
+        return False
+    return all(
+        os.path.isdir(os.path.join(path, name)) for name in ("configs", "services", "scripts")
+    ) and os.path.isfile(os.path.join(path, "batocera.conf"))
+
+
+def _arcade_checkout_root() -> str | None:
+    """Фиксированный путь /userdata/system/Arcade — источник для авто-deploy при reboot."""
+    if _looks_like_arcade_root(_ARCADE_CHECKOUT):
+        return os.path.realpath(_ARCADE_CHECKOUT)
+    return None
+
+
 def _deploy_source_root() -> str | None:
-    """Корень проекта с configs/, services/, scripts/ — может быть где угодно."""
+    """Корень проекта с configs/, services/, scripts/ — Arcade checkout или обход вверх от main.py."""
+    checkout = _arcade_checkout_root()
+    if checkout is not None:
+        return checkout
+
     deployed_scripts = os.path.realpath(os.path.join(_BATOCERA_SYSTEM_DIR, "scripts"))
-    if os.path.realpath(_SCRIPT_DIR) == deployed_scripts:
+    if os.path.realpath(_SCRIPTS_ROOT) == deployed_scripts:
         return None
 
-    current = os.path.realpath(_SCRIPT_DIR)
+    current = os.path.realpath(_MAIN_DIR)
     while True:
-        has_bundle = all(
-            os.path.isdir(os.path.join(current, name))
-            for name in ("configs", "services", "scripts")
-        )
-        if has_bundle and os.path.isfile(os.path.join(current, "batocera.conf")):
+        if _looks_like_arcade_root(current):
             return current
         parent = os.path.dirname(current)
         if parent == current:
@@ -142,9 +276,236 @@ def _deploy_source_root() -> str | None:
         current = parent
 
 
-_PROJECT_ROOT = _find_project_root()
-_VENV_DIR = _resolve_venv_dir()
-_WHEELS_DIR = _resolve_wheels_dir()
+def _arcade_fingerprint(source_root: str) -> str:
+    """Идентификатор версии checkout: git HEAD или mtime дерева scripts/services."""
+    git_dir = os.path.join(source_root, ".git")
+    if os.path.isdir(git_dir):
+        result = subprocess.run(
+            ["git", "-C", source_root, "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode == 0:
+            rev = result.stdout.strip()
+            if rev:
+                return f"git:{rev}"
+    latest = 0.0
+    for folder in ("scripts", "services"):
+        root = os.path.join(source_root, folder)
+        for dirpath, _dirnames, filenames in os.walk(root):
+            for name in filenames:
+                if name.endswith(".pyc") or name == "logs.log":
+                    continue
+                try:
+                    latest = max(latest, os.path.getmtime(os.path.join(dirpath, name)))
+                except OSError:
+                    pass
+    return f"mtime:{latest:.0f}"
+
+
+def _read_deploy_marker() -> tuple[str | None, str | None]:
+    if not os.path.isfile(_DEPLOY_MARKER):
+        return None, None
+    try:
+        with open(_DEPLOY_MARKER, encoding="utf-8") as marker:
+            lines = [line.strip() for line in marker.readlines() if line.strip()]
+    except OSError:
+        return None, None
+    source = lines[0] if lines else None
+    fingerprint = lines[1] if len(lines) > 1 else None
+    return source, fingerprint
+
+
+def _write_deploy_marker(source_root: str, fingerprint: str) -> None:
+    with open(_DEPLOY_MARKER, "w", encoding="utf-8") as marker:
+        marker.write(f"{source_root}\n{fingerprint}\n")
+
+
+def _chmod_services(services_dir: str) -> None:
+    if not os.path.isdir(services_dir):
+        return
+    for name in os.listdir(services_dir):
+        path = os.path.join(services_dir, name)
+        if not os.path.isfile(path):
+            continue
+        _fix_shell_line_endings(path)
+        try:
+            os.chmod(path, 0o755)
+        except OSError:
+            pass
+
+
+def _strip_scripts_exec_bits(scripts_dir: str) -> None:
+    if not os.path.isdir(scripts_dir):
+        return
+    for root, _dirs, files in os.walk(scripts_dir):
+        parts = set(root.split(os.sep))
+        if ".venv" in parts or "venv" in parts:
+            continue
+        for name in files:
+            if not name.endswith(".py"):
+                continue
+            path = os.path.join(root, name)
+            try:
+                mode = os.stat(path).st_mode
+                if mode & 0o111:
+                    os.chmod(path, mode & ~0o111)
+            except OSError:
+                pass
+
+
+def _deploy_copy(src: str, dst: str, *, follow_symlinks: bool = True) -> None:
+    shutil.copy2(src, dst, follow_symlinks=follow_symlinks)
+    if src.endswith(".py"):
+        try:
+            mode = os.stat(dst).st_mode
+            if mode & 0o111:
+                os.chmod(dst, mode & ~0o111)
+        except OSError:
+            pass
+
+
+def _ensure_batocera_services_enabled() -> None:
+    """system.services=main timer server tvon + batocera-services enable."""
+    conf_path = os.path.join(_BATOCERA_SYSTEM_DIR, "batocera.conf")
+    wanted = " ".join(_ARCADE_SERVICES)
+    if os.path.isfile(conf_path):
+        try:
+            with open(conf_path, encoding="utf-8") as conf_file:
+                lines = conf_file.readlines()
+            out: list[str] = []
+            found = False
+            for line in lines:
+                if line.startswith("system.services="):
+                    out.append(f"system.services={wanted}\n")
+                    found = True
+                else:
+                    out.append(line)
+            if not found:
+                out.append(f"\nsystem.services={wanted}\n")
+            with open(conf_path, "w", encoding="utf-8") as conf_file:
+                conf_file.writelines(out)
+        except OSError as error:
+            print(f"⚠ cannot update batocera.conf services: {error}")
+
+    for name in _ARCADE_SERVICES:
+        subprocess.run(
+            ["batocera-services", "enable", name],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+
+def _start_sibling_services() -> None:
+    for name in ("timer", "server", "tvon"):
+        subprocess.run(
+            ["batocera-services", "start", name],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+
+def _stop_sibling_services() -> None:
+    for name in ("timer", "server", "tvon"):
+        subprocess.run(
+            ["batocera-services", "stop", name],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+
+def _running_under_debugpy() -> bool:
+    if "debugpy" in sys.modules:
+        return True
+    return any("debugpy" in arg for arg in sys.argv)
+
+
+def deploy_to_batocera(force: bool = False, source_root: str | None = None) -> bool:
+    """Развёртывание Arcade → /userdata/system/. force=True или смена fingerprint."""
+    if not _is_batocera_system():
+        return False
+
+    if source_root is None:
+        source_root = _deploy_source_root()
+    if source_root is None:
+        return False
+    source_root = os.path.realpath(source_root)
+    if not _looks_like_arcade_root(source_root):
+        return False
+
+    fingerprint = _arcade_fingerprint(source_root)
+    _marker_source, marker_fp = _read_deploy_marker()
+    if os.path.isfile(_DEPLOY_MARKER) and not force and marker_fp == fingerprint:
+        return False
+
+    action = "re-deploy" if force or marker_fp else "first-time deploy"
+    print("=" * 60)
+    print(f"Batocera: {action} to /userdata/system/ (overwrite existing)...")
+    print(f"  source: {source_root}")
+    print(f"  fingerprint: {fingerprint}")
+    print("=" * 60)
+
+    for folder in ("configs", "services", "scripts"):
+        src = os.path.join(source_root, folder)
+        dst = os.path.join(_BATOCERA_SYSTEM_DIR, folder)
+        print(f"  {folder}/ -> {dst}")
+        shutil.copytree(
+            src,
+            dst,
+            dirs_exist_ok=True,
+            ignore=_deploy_ignore,
+            copy_function=_deploy_copy,
+        )
+
+    scripts_dest = os.path.join(_BATOCERA_SYSTEM_DIR, "scripts")
+
+    wheels_src = os.path.join(source_root, "wheels")
+    wheels_dst = os.path.join(scripts_dest, "wheels")
+    if os.path.isdir(wheels_src):
+        shutil.copytree(
+            wheels_src,
+            wheels_dst,
+            dirs_exist_ok=True,
+            copy_function=shutil.copy2,
+        )
+        print(f"  wheels/ -> {wheels_dst}")
+
+    project_conf = os.path.join(source_root, "batocera.conf")
+    dest_conf = os.path.join(_BATOCERA_SYSTEM_DIR, "batocera.conf")
+    if os.path.isfile(project_conf):
+        shutil.copy2(project_conf, dest_conf)
+        print(f"  batocera.conf -> {dest_conf}")
+
+    _chmod_services(os.path.join(_BATOCERA_SYSTEM_DIR, "services"))
+    _strip_scripts_exec_bits(scripts_dest)
+    _strip_scripts_exec_bits(os.path.join(source_root, "scripts"))
+    _ensure_batocera_services_enabled()
+
+    install_portable_git(source_root)
+    install_cursor_extensions(source_root)
+
+    _write_deploy_marker(source_root, fingerprint)
+
+    print("✓ Batocera deployment complete")
+    print(f"  marker: {_DEPLOY_MARKER}")
+    print(f"  Services: {' '.join(_ARCADE_SERVICES)}")
+    print("=" * 60)
+    return True
+
+
+def sync_arcade_checkout() -> bool:
+    """
+    Если есть /userdata/system/Arcade — задеплоить при смене версии (reboot / старт main).
+    Возвращает True, если копирование выполнялось.
+    """
+    source = _arcade_checkout_root() or _deploy_source_root()
+    if source is None:
+        return False
+    return deploy_to_batocera(force=False, source_root=source)
 
 
 def _deploy_ignore(dirpath: str, names: list[str]) -> set[str]:
@@ -169,71 +530,9 @@ def _fix_shell_line_endings(path: str) -> None:
         script_file.write(data.replace(b"\r\n", b"\n").replace(b"\r", b"\n"))
 
 
-def deploy_to_batocera(force: bool = False) -> bool:
-    """Первое развёртывание в /userdata/system/ с перезаписью; далее — пропуск (см. .arcade-deployed)."""
-    if not _is_batocera_system():
-        return False
-
-    source_root = _deploy_source_root()
-    if source_root is None:
-        return False
-
-    if os.path.isfile(_DEPLOY_MARKER) and not force:
-        return False
-
-    action = "re-deploy" if force else "first-time deploy"
-    print("=" * 60)
-    print(f"Batocera: {action} to /userdata/system/ (overwrite existing)...")
-    print(f"  source: {source_root}")
-    print("=" * 60)
-
-    for folder in ("configs", "services", "scripts"):
-        src = os.path.join(source_root, folder)
-        dst = os.path.join(_BATOCERA_SYSTEM_DIR, folder)
-        print(f"  {folder}/ -> {dst}")
-        shutil.copytree(
-            src,
-            dst,
-            dirs_exist_ok=True,
-            ignore=_deploy_ignore,
-            copy_function=shutil.copy2,
-        )
-
-    scripts_dest = os.path.join(_BATOCERA_SYSTEM_DIR, "scripts")
-
-    wheels_src = os.path.join(source_root, "wheels")
-    wheels_dst = os.path.join(scripts_dest, "wheels")
-    if os.path.isdir(wheels_src):
-        shutil.copytree(
-            wheels_src,
-            wheels_dst,
-            dirs_exist_ok=True,
-            copy_function=shutil.copy2,
-        )
-        print(f"  wheels/ -> {wheels_dst}")
-
-    project_conf = os.path.join(source_root, "batocera.conf")
-    dest_conf = os.path.join(_BATOCERA_SYSTEM_DIR, "batocera.conf")
-    if os.path.isfile(project_conf):
-        shutil.copy2(project_conf, dest_conf)
-        print(f"  batocera.conf -> {dest_conf}")
-
-    service_main = os.path.join(_BATOCERA_SYSTEM_DIR, "services", "main")
-    if os.path.isfile(service_main):
-        _fix_shell_line_endings(service_main)
-        os.chmod(service_main, 0o755)
-
-    install_portable_git(source_root)
-    install_cursor_extensions(source_root)
-
-    with open(_DEPLOY_MARKER, "w", encoding="utf-8") as marker:
-        marker.write(f"{source_root}\n")
-
-    print("✓ Batocera deployment complete")
-    print(f"  marker: {_DEPLOY_MARKER}")
-    print("  Service: /userdata/system/services/main {start|stop|status}")
-    print("=" * 60)
-    return True
+_PROJECT_ROOT = _find_project_root()
+_VENV_DIR = _resolve_venv_dir()
+_WHEELS_DIR = _resolve_wheels_dir()
 
 
 def _host_arch() -> str:
@@ -325,7 +624,7 @@ def install_portable_git(source_root: str | None = None) -> bool:
     tarball = _find_git_tarball(root)
     if tarball is None:
         print("⚠ vendor/git: no matching tarball for this arch — git not installed")
-        print(f"  expected arch={_host_arch()}, run: python3 scripts/main.py vendor-git")
+        print(f"  expected arch={_host_arch()}, run: python3 scripts/main/main.py vendor-git")
         return False
 
     print(f"Installing portable git from {os.path.basename(tarball)}...")
@@ -556,8 +855,8 @@ def _deps_installed(python_path: str | None = None) -> bool:
 
 def _entry_script() -> str:
     if _is_batocera_system() and not _is_deployed_scripts():
-        return os.path.join(_DEPLOYED_SCRIPTS_DIR, "main.py")
-    return os.path.join(_SCRIPT_DIR, "main.py")
+        return os.path.join(_DEPLOYED_SCRIPTS_DIR, "main", "main.py")
+    return os.path.join(_MAIN_DIR, "main.py")
 
 
 def _reexec_into_runtime() -> None:
@@ -602,7 +901,7 @@ def _install_dependencies() -> bool:
 
     print("✗ ERROR: Failed to install dependencies")
     if not wheels:
-        print("  Put aarch64 wheels into wheels/ or run: python scripts/main.py vendor-wheels")
+        print("  Put aarch64 wheels into wheels/ or run: python scripts/main/main.py vendor-wheels")
     return False
 
 
@@ -683,7 +982,7 @@ def _link_workspace_venv() -> None:
     if not _is_batocera_system():
         return
     source_root = _deploy_source_root() or (
-        os.path.dirname(_SCRIPT_DIR) if os.path.basename(_SCRIPT_DIR) == "scripts" else None
+        os.path.dirname(_SCRIPTS_ROOT) if os.path.basename(_SCRIPTS_ROOT) == "scripts" else None
     )
     if not source_root or not os.path.isdir(_VENV_DIR):
         return
@@ -708,6 +1007,8 @@ def _link_workspace_venv() -> None:
 
 # Инициализируем venv на старте
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] in ("gameStart", "gameStop"):
+        raise SystemExit(0)
     if len(sys.argv) > 1 and sys.argv[1] == "vendor-wheels":
         raise SystemExit(vendor_wheels())
     if len(sys.argv) > 1 and sys.argv[1] == "vendor-git":
@@ -736,296 +1037,14 @@ if __name__ == "__main__":
 # ОСНОВНОЙ КОД
 # ============================================================================
 
-SCRIPT_DIR = _SCRIPT_DIR
+SCRIPT_DIR = _MAIN_DIR
+SCRIPTS_ROOT = _SCRIPTS_ROOT
 PROJECT_ROOT = _find_project_root()
-LOG_FILE = os.path.join(SCRIPT_DIR, "logs.log")
-CONFIG_PATH = os.path.join(SCRIPT_DIR, _CONFIG_FILENAME)
-
-_log_lock = threading.Lock()
-
-
-def log(message: str) -> None:
-    """Строка в консоль и в scripts/logs.log с датой/временем."""
-    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    line = f"{stamp} - INFO - {message}"
-    with _log_lock:
-        print(line, flush=True)
-        try:
-            with open(LOG_FILE, "a", encoding="utf-8") as log_file:
-                log_file.write(line + "\n")
-        except OSError:
-            pass
-
-
-@dataclass(frozen=True)
-class ServerConfig:
-    port: int = 5000
-
-
-@dataclass(frozen=True)
-class TimerConfig:
-    time_step: int = 5
-    time_wait: int = 60
-    time_reset: int = 5
-    # Raspberry — Pi управляет реле/таймером; Arduino — Pi имитирует радио → Arduino
-    timer_mode: str = "Raspberry"
-
-
-@dataclass(frozen=True)
-class GpioConfig:
-    rf_increase: int = 5
-    rf_playpause: int = 6
-    rf_stop: int = 13
-    r_buttons: int = 17
-    r_playpause: int = 27
-    r_stop: int = 22
-    relay_active_low: bool = True
-
-
-@dataclass(frozen=True)
-class TerminalConfig:
-    """Сухой контакт терминала (Arduino TERM_OUT_CASHLESS)."""
-    enabled: bool = True
-    pin: int = 26
-    active_high: bool = False
-    debounce_ms: int = 0
-    start_delay_ms: int = 2000
-
-
-@dataclass(frozen=True)
-class MatrixConfig:
-    enabled: bool = True
-    brightness: int = 7
-    scroll_speed: int = 7
-    text_display: str = "АРЕНДА: т. +79233549295"
-    din: int = 10
-    clk: int = 11
-    cs: int = 8
-    cascaded: int = 4
-    block_orientation: int = 90
-    rotate: int = 2
-    blocks_reverse: bool = True
-    test_on_start: bool = True
-
-
-def _read_positive_int(section: dict, key: str, default: int) -> int:
-    if key not in section:
-        return default
-    value = section[key]
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise ValueError(f"{key} must be an integer")
-    if value <= 0:
-        raise ValueError(f"{key} must be greater than 0")
-    return value
-
-
-def _read_string(section: dict, key: str, default: str) -> str:
-    if key not in section:
-        return default
-    value = section[key]
-    if not isinstance(value, str):
-        raise ValueError(f"{key} must be a string")
-    return value
-
-
-def _read_bool(section: dict, key: str, default: bool) -> bool:
-    if key not in section:
-        return default
-    value = section[key]
-    if not isinstance(value, bool):
-        raise ValueError(f"{key} must be a boolean")
-    return value
-
-
-def _read_brightness(section: dict, key: str, default: int) -> int:
-    if key not in section:
-        return default
-    value = section[key]
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise ValueError(f"{key} must be an integer")
-    if value < 0 or value > 15:
-        raise ValueError(f"{key} must be between 0 and 15")
-    return value
-
-
-def _read_bcm_pin(section: dict, key: str, default: int) -> int:
-    if key not in section:
-        return default
-    value = section[key]
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise ValueError(f"{key} must be an integer")
-    if value < 0 or value > 53:
-        raise ValueError(f"{key} must be a BCM pin number between 0 and 53")
-    return value
-
-
-def _read_non_negative_int(section: dict, key: str, default: int) -> int:
-    if key not in section:
-        return default
-    value = section[key]
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise ValueError(f"{key} must be an integer")
-    if value < 0:
-        raise ValueError(f"{key} must be greater than or equal to 0")
-    return value
-
-
-def _read_block_orientation(section: dict, key: str, default: int) -> int:
-    if key not in section:
-        return default
-    value = section[key]
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise ValueError(f"{key} must be an integer")
-    if value not in (0, 90, -90, 180):
-        raise ValueError(f"{key} must be one of 0, 90, -90, 180")
-    return value
-
-
-def _read_rotate(section: dict, key: str, default: int) -> int:
-    if key not in section:
-        return default
-    value = section[key]
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise ValueError(f"{key} must be an integer")
-    if value not in (0, 1, 2, 3):
-        raise ValueError(f"{key} must be 0, 1, 2, or 3 (x90°)")
-    return value
-
-
-def load_server_config() -> ServerConfig:
-    defaults = ServerConfig()
-    if not os.path.isfile(CONFIG_PATH):
-        return defaults
-
-    with open(CONFIG_PATH, "rb") as config_file:
-        data = tomllib.load(config_file)
-
-    server_section = data.get("server", {})
-    if not isinstance(server_section, dict):
-        raise ValueError("[server] section must be a table")
-
-    return ServerConfig(
-        port=_read_positive_int(server_section, "port", defaults.port),
-    )
-
-
-def load_gpio_config() -> GpioConfig:
-    defaults = GpioConfig()
-    if not os.path.isfile(CONFIG_PATH):
-        return defaults
-
-    with open(CONFIG_PATH, "rb") as config_file:
-        data = tomllib.load(config_file)
-
-    gpio_section = data.get("gpio", {})
-    if not isinstance(gpio_section, dict):
-        raise ValueError("[gpio] section must be a table")
-
-    return GpioConfig(
-        rf_increase=_read_bcm_pin(gpio_section, "rf_increase", defaults.rf_increase),
-        rf_playpause=_read_bcm_pin(gpio_section, "rf_playpause", defaults.rf_playpause),
-        rf_stop=_read_bcm_pin(gpio_section, "rf_stop", defaults.rf_stop),
-        r_buttons=_read_bcm_pin(gpio_section, "r_buttons", defaults.r_buttons),
-        r_playpause=_read_bcm_pin(gpio_section, "r_playpause", defaults.r_playpause),
-        r_stop=_read_bcm_pin(gpio_section, "r_stop", defaults.r_stop),
-        relay_active_low=_read_bool(gpio_section, "relay_active_low", defaults.relay_active_low),
-    )
-
-
-def _read_timer_mode(section: dict, default: str = "Raspberry") -> str:
-    """timer_mode / mode: Raspberry (по умолчанию) или Arduino."""
-    raw = section.get("timer_mode", section.get("mode", default))
-    if not isinstance(raw, str):
-        raise ValueError("timer_mode must be a string (Raspberry or Arduino)")
-    normalized = raw.strip().lower()
-    if normalized in {"raspberry", "rpi", "pi"}:
-        return "Raspberry"
-    if normalized == "arduino":
-        return "Arduino"
-    raise ValueError(
-        f"timer_mode must be 'Raspberry' or 'Arduino', got {raw!r}"
-    )
-
-
-def load_timer_config() -> TimerConfig:
-    defaults = TimerConfig()
-    if not os.path.isfile(CONFIG_PATH):
-        return defaults
-
-    with open(CONFIG_PATH, "rb") as config_file:
-        data = tomllib.load(config_file)
-
-    timer_section = data.get("timer", {})
-    if not isinstance(timer_section, dict):
-        raise ValueError("[timer] section must be a table")
-
-    return TimerConfig(
-        time_step=_read_positive_int(timer_section, "time_step", defaults.time_step),
-        time_wait=_read_positive_int(timer_section, "time_wait", defaults.time_wait),
-        time_reset=_read_positive_int(timer_section, "time_reset", defaults.time_reset),
-        timer_mode=_read_timer_mode(timer_section, defaults.timer_mode),
-    )
-
-
-def load_terminal_config() -> TerminalConfig:
-    defaults = TerminalConfig()
-    if not os.path.isfile(CONFIG_PATH):
-        return defaults
-
-    with open(CONFIG_PATH, "rb") as config_file:
-        data = tomllib.load(config_file)
-
-    section = data.get("terminal", {})
-    if not isinstance(section, dict):
-        raise ValueError("[terminal] section must be a table")
-
-    return TerminalConfig(
-        enabled=_read_bool(section, "enabled", defaults.enabled),
-        pin=_read_bcm_pin(section, "pin", defaults.pin),
-        active_high=_read_bool(section, "active_high", defaults.active_high),
-        debounce_ms=_read_non_negative_int(section, "debounce_ms", defaults.debounce_ms),
-        start_delay_ms=_read_positive_int(section, "start_delay_ms", defaults.start_delay_ms),
-    )
-
-
-def load_matrix_config() -> MatrixConfig:
-    defaults = MatrixConfig()
-    if not os.path.isfile(CONFIG_PATH):
-        return defaults
-
-    with open(CONFIG_PATH, "rb") as config_file:
-        data = tomllib.load(config_file)
-
-    matrix_section = data.get("matrix", {})
-    if not isinstance(matrix_section, dict):
-        raise ValueError("[matrix] section must be a table")
-
-    return MatrixConfig(
-        enabled=_read_bool(matrix_section, "enabled", defaults.enabled),
-        brightness=_read_brightness(matrix_section, "brightness", defaults.brightness),
-        scroll_speed=_read_positive_int(matrix_section, "scroll_speed", defaults.scroll_speed),
-        text_display=_read_string(matrix_section, "text_display", defaults.text_display),
-        din=_read_bcm_pin(matrix_section, "din", defaults.din),
-        clk=_read_bcm_pin(matrix_section, "clk", defaults.clk),
-        cs=_read_bcm_pin(matrix_section, "cs", defaults.cs),
-        cascaded=_read_positive_int(matrix_section, "cascaded", defaults.cascaded),
-        block_orientation=_read_block_orientation(
-            matrix_section, "block_orientation", defaults.block_orientation
-        ),
-        rotate=_read_rotate(matrix_section, "rotate", defaults.rotate),
-        blocks_reverse=_read_bool(matrix_section, "blocks_reverse", defaults.blocks_reverse),
-        test_on_start=_read_bool(matrix_section, "test_on_start", defaults.test_on_start),
-    )
-
 
 try:
-    server_config = load_server_config()
-    timer_config = load_timer_config()
-    gpio_config = load_gpio_config()
-    terminal_config = load_terminal_config()
-    matrix_config = load_matrix_config()
+    ssh_config = load_ssh_config()
 except (tomllib.TOMLDecodeError, ValueError, OSError) as error:
-    print(f"ERROR: Failed to load config from {CONFIG_PATH}: {error}", file=sys.stderr)
+    print(f"ERROR: Failed to load SSH config from {CONFIG_PATH}: {error}", file=sys.stderr)
     sys.exit(1)
 
 
@@ -1034,20 +1053,21 @@ def _is_debugpy_process(args_text):
 
 
 def _is_stale_project_process(args_text):
-    server_py = os.path.join(SCRIPT_DIR, "server.py")
-    timer_py = os.path.join(SCRIPT_DIR, "timer.py")
-    main_py = os.path.join(SCRIPT_DIR, "main.py")
-    legacy_main_py = os.path.join(PROJECT_ROOT, "main.py")
-    legacy_server_py = os.path.join(PROJECT_ROOT, "server.py")
-    legacy_timer_py = os.path.join(PROJECT_ROOT, "timer.py")
-    if server_py in args_text or timer_py in args_text:
-        return True
-    if main_py in args_text and not _is_debugpy_process(args_text):
-        return True
-    if legacy_server_py in args_text or legacy_timer_py in args_text:
-        return True
-    if legacy_main_py in args_text and not _is_debugpy_process(args_text):
-        return True
+    """Старые пути multiprocessing main→server/timer + текущие сервисы."""
+    paths = [
+        os.path.join(SCRIPT_DIR, "main.py"),
+        os.path.join(SCRIPTS_ROOT, "main", "main.py"),
+        os.path.join(SCRIPTS_ROOT, "main.py"),  # legacy
+        os.path.join(SCRIPTS_ROOT, "server.py"),
+        os.path.join(SCRIPTS_ROOT, "timer.py"),
+        os.path.join(SCRIPTS_ROOT, "server", "server.py"),
+        os.path.join(SCRIPTS_ROOT, "timer", "timer.py"),
+    ]
+    for path in paths:
+        if path in args_text:
+            if path.endswith("main.py") and _is_debugpy_process(args_text):
+                continue
+            return True
     return False
 
 
@@ -1079,7 +1099,6 @@ def _kill_stale_pids(pids):
     unique_pids = sorted({int(pid) for pid in pids if str(pid).isdigit()})
     if not unique_pids:
         return
-
     for pid in unique_pids:
         try:
             os.kill(pid, signal.SIGTERM)
@@ -1087,9 +1106,7 @@ def _kill_stale_pids(pids):
             pass
         except OSError:
             pass
-
     time.sleep(0.5)
-
     for pid in unique_pids:
         try:
             os.kill(pid, 0)
@@ -1100,25 +1117,16 @@ def _kill_stale_pids(pids):
             pass
 
 
-def cleanup_stale_project_processes(current_pid=None, log=None):
+def cleanup_stale_project_processes(current_pid=None, log_fn=None):
+    """Чистит только legacy-оркестратор scripts/main.py (не timer/server/tvon)."""
     if current_pid is None:
         current_pid = os.getpid()
-    if log is None:
-        log = lambda *args, **kwargs: None
-
+    if log_fn is None:
+        log_fn = lambda *a, **k: None
+    legacy_main = os.path.join(SCRIPTS_ROOT, "main.py")
     try:
         for attempt in range(3):
             stale_pids = []
-
-            for pid in _gpio_holder_pids():
-                if pid == current_pid:
-                    continue
-                cmdline = _process_cmdline(pid)
-                if not cmdline:
-                    continue
-                if SCRIPT_DIR in cmdline or PROJECT_ROOT in cmdline or _is_stale_project_process(cmdline):
-                    stale_pids.append(pid)
-
             result = subprocess.run(
                 ["ps", "-eo", "pid,args"],
                 capture_output=True,
@@ -1133,169 +1141,76 @@ def cleanup_stale_project_processes(current_pid=None, log=None):
                 if not pid_text.isdigit():
                     continue
                 pid = int(pid_text)
-                if pid == current_pid:
+                if pid == current_pid or _is_debugpy_process(args_text):
                     continue
-                if _is_debugpy_process(args_text):
-                    continue
-                if _is_stale_project_process(args_text):
+                # Только старый файл scripts/main.py (не scripts/main/main.py)
+                if legacy_main in args_text and f"{os.sep}main{os.sep}main.py" not in args_text:
                     stale_pids.append(pid)
 
             stale_pids = sorted({pid for pid in stale_pids if pid != current_pid})
             if not stale_pids:
                 break
-
-            log("Cleaning stale project processes (attempt %d): %s", attempt + 1, stale_pids)
+            log_fn("Cleaning stale project processes (attempt %d): %s", attempt + 1, stale_pids)
             _kill_stale_pids(stale_pids)
             time.sleep(0.3)
     except Exception as exc:
-        log("Failed to cleanup stale project processes: %s", exc)
+        log_fn("Failed to cleanup stale project processes: %s", exc)
 
-
-def cleanup_processes(server_process, timer_process, timeout=5):
-    """Gracefully terminate all child processes"""
-    processes = [
-        ("Server", server_process),
-        ("Timer", timer_process)
-    ]
-    
-    # Сначала отправляем SIGTERM
-    for name, proc in processes:
-        if proc.is_alive():
-            logging.info("Sending SIGTERM to %s process (PID: %d)", name, proc.pid)
-            proc.terminate()
-    
-    # Ждём завершения с таймаутом
-    start_time = time.time()
-    while time.time() - start_time < timeout:
-        alive_procs = [p for _, p in processes if p.is_alive()]
-        if not alive_procs:
-            logging.info("All child processes terminated gracefully")
-            return
-        time.sleep(0.5)
-    
-    # Если ещё живы - убиваем SIGKILL
-    for name, proc in processes:
-        if proc.is_alive():
-            logging.warning("Force killing %s process (PID: %d)", name, proc.pid)
-            proc.kill()
-    
-    # Финальный join
-    for name, proc in processes:
-        proc.join(timeout=2)
-        if proc.is_alive():
-            logging.error("%s process still alive after kill!", name)
 
 def signal_handler(signum, frame):
-    """Обработчик сигналов для graceful shutdown"""
-    logging.warning("Received signal %d, initiating graceful shutdown...", signum)
+    log(f"Received signal {signum}, initiating graceful shutdown...")
     sys.exit(0)
 
 
 def main():
-    import server
-    import timer
-
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(levelname)s - %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-        handlers=[
-            logging.FileHandler(LOG_FILE, encoding="utf-8"),
-            logging.StreamHandler(sys.stderr),
-        ],
-    )
-
-    # Регистрируем обработчики сигналов
     signal.signal(signal.SIGTERM, signal_handler)
     signal.signal(signal.SIGINT, signal_handler)
-    
-    logging.info("MAIN service STARTED")
-    logging.info("Server config: port=%d", server_config.port)
-    logging.info(
-        "Timer config: mode=%s time_step=%d min, time_wait=%d sec, time_reset=%d min",
-        timer_config.timer_mode,
-        timer_config.time_step,
-        timer_config.time_wait,
-        timer_config.time_reset,
-    )
-    logging.info(
-        "GPIO config: inputs +/play/stop=%d/%d/%d relays buttons/play/stop=%d/%d/%d active_low=%s",
-        gpio_config.rf_increase,
-        gpio_config.rf_playpause,
-        gpio_config.rf_stop,
-        gpio_config.r_buttons,
-        gpio_config.r_playpause,
-        gpio_config.r_stop,
-        gpio_config.relay_active_low,
-    )
-    logging.info(
-        "Terminal config: enabled=%s pin=%d active_high=%s debounce=%dms start_delay=%dms",
-        terminal_config.enabled,
-        terminal_config.pin,
-        terminal_config.active_high,
-        terminal_config.debounce_ms,
-        terminal_config.start_delay_ms,
-    )
-    logging.info(
-        "Matrix config: enabled=%s brightness=%d din/clk/cs=%d/%d/%d cascaded=%d",
-        matrix_config.enabled,
-        matrix_config.brightness,
-        matrix_config.din,
-        matrix_config.clk,
-        matrix_config.cs,
-        matrix_config.cascaded,
-    )
 
-    cleanup_stale_project_processes(log=logging.info)
-
+    log("MAIN service STARTED (deploy/venv/ssh hub)")
     try:
-        multiprocessing.set_start_method("spawn")
-    except RuntimeError:
-        pass
-
-    queue_main = multiprocessing.Queue()
-    server_process = None
-    timer_process = None
-    
-    try:
-        # Запускаем server.py в отдельном процессе
-        server_process = multiprocessing.Process(
-            target=server.server_start_async,
-            args=(queue_main, "0.0.0.0", server_config.port),
-            daemon=False
-        )
-        server_process.start()
-        logging.info("'server.py' started (PID: %d)", server_process.pid)
-        
-        # Запускаем timer.py в отдельном процессе
-        timer_process = multiprocessing.Process(
-            target=timer.loop, 
-            args=(queue_main,),
-            daemon=False  # Явно отмечаем как non-daemon
-        )
-        timer_process.start()
-        logging.info("'timer.py' started (PID: %d)", timer_process.pid)
-        
-        # Основной цикл main.py
-        while True:
-            # Проверяем живы ли процессы
-            if not server_process.is_alive():
-                logging.error("'server.py' died unexpectedly!")
-                break
-            if not timer_process.is_alive():
-                logging.error("'timer.py' died unexpectedly!")
-                break
-            time.sleep(10)
-            
-    except KeyboardInterrupt:
-        logging.warning("MAIN service received SIGINT")
+        if sync_arcade_checkout():
+            log("MAIN: Arcade checkout synced to /userdata/system/")
+            _refresh_paths()
+            setup_venv()
+        else:
+            source = _arcade_checkout_root()
+            if source:
+                log(f"MAIN: Arcade checkout up to date ({source})")
+            _ensure_batocera_services_enabled()
+        _strip_scripts_exec_bits(os.path.join(_BATOCERA_SYSTEM_DIR, "scripts"))
+        arcade = _arcade_checkout_root()
+        if arcade:
+            _strip_scripts_exec_bits(os.path.join(arcade, "scripts"))
+        if _running_under_debugpy():
+            # Debug Arcade/Main: не поднимать batocera timer/server — иначе два процесса,
+            # GPIO busy и сокет у «пустого» timer (RF: skip click).
+            _stop_sibling_services()
+            log("MAIN: debugpy — batocera timer/server/tvon stopped (use launch Arcade)")
+        else:
+            _start_sibling_services()
+            log("MAIN: sibling services start requested (timer server tvon)")
     except Exception as e:
-        logging.error("Error in MAIN service: %s", str(e), exc_info=True)
+        log(f"MAIN: arcade sync/start warning: {e}")
+
+    log(f"SSH config: user={ssh_config.user} (password hidden)")
+    log(
+        "Sibling services: "
+        f"timer={os.path.join(SCRIPTS_ROOT, 'timer', 'timer.py')} "
+        f"server={os.path.join(SCRIPTS_ROOT, 'server', 'server.py')} "
+        f"tvon={os.path.join(SCRIPTS_ROOT, 'tvon', 'tvon.py')}"
+    )
+    cleanup_stale_project_processes(log_fn=lambda fmt, *a: log(fmt % a if a else fmt))
+
+    try:
+        while True:
+            time.sleep(60)
+    except KeyboardInterrupt:
+        log("MAIN service received SIGINT")
+    except Exception as e:
+        log(f"Error in MAIN service: {e}")
     finally:
-        logging.info("Shutting down child processes...")
-        if server_process and timer_process:
-            cleanup_processes(server_process, timer_process)
-        logging.info("MAIN service IS STOPPED")
+        log("MAIN service IS STOPPED")
+
 
 if __name__ == "__main__":
     main()

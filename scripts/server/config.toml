@@ -1,0 +1,4 @@
+[server]
+port = 5000
+# Unix-сокет сервиса timer (должен совпадать с [timer] cmd_socket)
+timer_socket = "/var/run/arcade-timer.sock"
