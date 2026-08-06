@@ -11,6 +11,7 @@ import socket
 import tempfile
 import platform
 import gzip
+import hashlib
 import tomllib
 import threading
 from dataclasses import dataclass
@@ -424,6 +425,80 @@ def _running_under_debugpy() -> bool:
     return any("debugpy" in arg for arg in sys.argv)
 
 
+def _file_digest(path: str) -> bytes | None:
+    if not os.path.isfile(path):
+        return None
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(65536), b""):
+            digest.update(chunk)
+    return digest.digest()
+
+
+def install_shared_dropbear_keys(source_root: str) -> bool:
+    """deploy/dropbear → /userdata/system/ssh. True = ключи сменились (restart dropbear)."""
+    if not _is_batocera_system():
+        return False
+
+    seed_dir = os.path.join(source_root, "deploy", "dropbear")
+    dest_dir = os.path.join(_BATOCERA_SYSTEM_DIR, "ssh")
+    os.makedirs(seed_dir, mode=0o755, exist_ok=True)
+    os.makedirs(dest_dir, mode=0o755, exist_ok=True)
+
+    dropbearkey = shutil.which("dropbearkey")
+    changed = False
+
+    for key_name, key_type in (
+        ("dropbear_ed25519_host_key", "ed25519"),
+        ("dropbear_rsa_host_key", "rsa"),
+    ):
+        seed_path = os.path.join(seed_dir, key_name)
+        if not os.path.isfile(seed_path):
+            if not dropbearkey:
+                print(f"⚠ dropbearkey missing — cannot create {key_name}")
+                continue
+            print(f"  generating shared {key_name} ...")
+            result = subprocess.run(
+                [dropbearkey, "-t", key_type, "-f", seed_path],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if result.returncode != 0 or not os.path.isfile(seed_path):
+                err = ((result.stdout or "") + (result.stderr or "")).strip()[:200]
+                print(f"⚠ failed to generate {key_name}: {err}")
+                continue
+            os.chmod(seed_path, 0o600)
+
+        dest_path = os.path.join(dest_dir, key_name)
+        before = _file_digest(dest_path)
+        shutil.copy2(seed_path, dest_path)
+        os.chmod(dest_path, 0o600)
+        after = _file_digest(dest_path)
+        if before != after:
+            changed = True
+            print(f"  dropbear key -> {dest_path}")
+
+        pub_seed = seed_path + ".pub"
+        if os.path.isfile(pub_seed):
+            shutil.copy2(pub_seed, dest_path + ".pub")
+            os.chmod(dest_path + ".pub", 0o644)
+
+    # Убрать устаревший ecdsa seed/dest, если остался от старых образов — не трогаем
+
+    if changed:
+        init_script = "/etc/init.d/S50dropbear"
+        if os.path.isfile(init_script):
+            print("  restarting dropbear (shared host keys applied)...")
+            subprocess.run([init_script, "restart"], capture_output=True, text=True, check=False)
+        else:
+            print("⚠ S50dropbear not found — reboot to apply new host keys")
+    else:
+        print("  dropbear host keys already match shared seed")
+
+    return changed
+
+
 def deploy_to_batocera(force: bool = False, source_root: str | None = None) -> bool:
     """Развёртывание Arcade → /userdata/system/. force=True или смена fingerprint."""
     if not _is_batocera_system():
@@ -440,6 +515,9 @@ def deploy_to_batocera(force: bool = False, source_root: str | None = None) -> b
     fingerprint = _arcade_fingerprint(source_root)
     _marker_source, marker_fp = _read_deploy_marker()
     if os.path.isfile(_DEPLOY_MARKER) and not force and marker_fp == fingerprint:
+        # Ключи всё равно подтягиваем: их могли обновить отдельно от fingerprint
+        print("Deploy fingerprint unchanged — syncing shared dropbear keys only")
+        install_shared_dropbear_keys(source_root)
         return False
 
     action = "re-deploy" if force or marker_fp else "first-time deploy"
@@ -479,6 +557,9 @@ def deploy_to_batocera(force: bool = False, source_root: str | None = None) -> b
     if os.path.isfile(project_conf):
         shutil.copy2(project_conf, dest_conf)
         print(f"  batocera.conf -> {dest_conf}")
+
+    print("  shared dropbear host keys...")
+    install_shared_dropbear_keys(source_root)
 
     _chmod_services(os.path.join(_BATOCERA_SYSTEM_DIR, "services"))
     _strip_scripts_exec_bits(scripts_dest)

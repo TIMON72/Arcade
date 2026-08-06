@@ -4,7 +4,6 @@
   "executionEnvironments": [
     {
       "root": ".",
-      "python": "/userdata/system/scripts/.venv/bin/python",
       "extraPaths": [
         "scripts",
         "scripts/main",

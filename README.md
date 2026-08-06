@@ -6,14 +6,25 @@
 ## Установка (после Batocera)
 
 1. Положить проект в `/userdata/system/Arcade` (клон или копия).
-2. Один раз:
+2. Один раз (через `bash` — у `install` после `git clone`/`pull` может не быть `+x`):
 
 ```bash
-/userdata/system/Arcade/install
+bash /userdata/system/Arcade/install
 reboot
 ```
 
 3. Готово. Сервисы: `main`, `timer`, `server`, `tvon`.
+
+### SSH (смена SSD)
+
+`install`/`deploy` копирует `deploy/dropbear/*` → `/userdata/system/ssh/` (общий host key флота — в git).
+
+На ПК Windows один раз — скачать/скопировать и запустить:
+
+`deploy/ssh-client-windows.bat`
+
+(подсеть по умолчанию `192.168.1.*`, правится в начале bat).  
+Linux/macOS: `deploy/ssh-client.config` → `~/.ssh/config`.
 
 ### Обновление
 
@@ -28,7 +39,6 @@ cd /userdata/system/Arcade && git pull && reboot
 | `/userdata/system/Arcade` | исходники |
 | `/userdata/system/scripts` | рабочий код |
 | `/userdata/system/services` | скрипты сервисов Batocera |
-
 Принудительно без reboot: `python3 /userdata/system/Arcade/scripts/main/main.py deploy`
 
 ## Сервисы
