@@ -4,6 +4,9 @@ logs.log
 __pycache__
 .lgd-nfy0
 
+# Local cabinet IPs / SSH password for deploy.ps1
+deploy/machines.json
+
 # Batocera runtime / local noise (не коммитить)
 configs/**/es_log*.txt
 configs/emulationstation/tmp/

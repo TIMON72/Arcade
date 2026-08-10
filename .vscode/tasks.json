@@ -55,6 +55,108 @@
             },
             "problemMatcher": [],
             "presentation": { "reveal": "silent", "panel": "shared", "showReuseMessage": false, "close": true }
+        },
+        {
+            "label": "Sync to machine",
+            "type": "shell",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${workspaceFolder}\\deploy\\deploy.ps1\" \"${input:arcadeTarget}\"",
+            "options": {
+                "cwd": "${workspaceFolder}",
+                "env": {}
+            },
+            "problemMatcher": [],
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated",
+                "focus": true,
+                "showReuseMessage": false
+            },
+            "group": "build"
+        },
+        {
+            "label": "Sync to machine + restart services",
+            "type": "shell",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${workspaceFolder}\\deploy\\deploy.ps1\" \"${input:arcadeTarget}\" -Restart",
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "problemMatcher": [],
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated",
+                "focus": true,
+                "showReuseMessage": false
+            }
+        },
+        {
+            "label": "Sync to machine (full + wheels/vendor)",
+            "type": "shell",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${workspaceFolder}\\deploy\\deploy.ps1\" \"${input:arcadeTarget}\" -Full -Restart",
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "problemMatcher": [],
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated",
+                "focus": true,
+                "showReuseMessage": false
+            }
+        },
+        {
+            "label": "Sync to machine (code only, no deploy)",
+            "type": "shell",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${workspaceFolder}\\deploy\\deploy.ps1\" \"${input:arcadeTarget}\" -NoDeploy",
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "problemMatcher": [],
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated",
+                "focus": true,
+                "showReuseMessage": false
+            }
+        },
+        {
+            "label": "Remote logs",
+            "type": "shell",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${workspaceFolder}\\deploy\\logs.ps1\" \"${input:arcadeTarget}\"",
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "problemMatcher": [],
+            "isBackground": true,
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated",
+                "focus": true,
+                "showReuseMessage": false
+            }
+        },
+        {
+            "label": "Remote logs (all services)",
+            "type": "shell",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${workspaceFolder}\\deploy\\logs.ps1\" \"${input:arcadeTarget}\" -AllServices",
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "problemMatcher": [],
+            "isBackground": true,
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated",
+                "focus": true,
+                "showReuseMessage": false
+            }
+        }
+    ],
+    "inputs": [
+        {
+            "id": "arcadeTarget",
+            "type": "promptString",
+            "description": "IP or name from deploy/machines.json (e.g. 192.168.1.120 or zero)",
+            "default": "zero"
         }
     ]
 }

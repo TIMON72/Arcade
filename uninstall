@@ -1,0 +1,58 @@
+#!/bin/bash
+# Снятие Arcade с Batocera (сервисы + /userdata/system/scripts).
+# Папка проекта (откуда запущен uninstall) не трогается.
+set -euo pipefail
+
+ARCADE="$(cd "$(dirname "$0")" && pwd)"
+SYSTEM="/userdata/system"
+SERVICES=(main timer server tvon)
+
+if [[ ! -f "${ARCADE}/batocera.conf" || ! -d "${ARCADE}/scripts" || ! -d "${ARCADE}/services" ]]; then
+    echo "ERROR: run this from the Arcade project root"
+    exit 1
+fi
+
+echo "Uninstalling Arcade runtime from ${SYSTEM}/ ..."
+echo "  Keeping sources: ${ARCADE}"
+
+for svc in "${SERVICES[@]}"; do
+    batocera-services stop "$svc" 2>/dev/null || true
+done
+for svc in "${SERVICES[@]}"; do
+    batocera-services disable "$svc" 2>/dev/null || true
+done
+
+CONF="${SYSTEM}/batocera.conf"
+if [[ -f "$CONF" ]]; then
+    # Arcade пишет свою строку system.services=main timer server tvon
+    sed -i '/^system\.services=/d' "$CONF"
+fi
+
+for svc in "${SERVICES[@]}"; do
+    rm -f "${SYSTEM}/services/${svc}"
+done
+
+# Рабочая копия (venv, logs, deployed scripts) — не дерево Arcade/
+if [[ -e "${SYSTEM}/scripts" ]]; then
+    # Не снести исходники, если scripts — тот же путь/symlink внутрь Arcade
+    scripts_real="$(realpath "${SYSTEM}/scripts" 2>/dev/null || echo "${SYSTEM}/scripts")"
+    arcade_real="$(realpath "$ARCADE" 2>/dev/null || echo "$ARCADE")"
+    case "$scripts_real" in
+        "$arcade_real"|"$arcade_real"/*)
+            echo "WARNING: ${SYSTEM}/scripts points inside Arcade — skip rm -rf scripts"
+            ;;
+        *)
+            rm -rf "${SYSTEM}/scripts"
+            echo "  removed ${SYSTEM}/scripts"
+            ;;
+    esac
+fi
+
+sync
+
+echo
+echo "OK. Arcade runtime removed."
+echo "  • Sources kept: ${ARCADE}"
+echo "  • Reinstall: bash ${ARCADE}/install && reboot"
+echo "  • Reboot recommended now"
+echo

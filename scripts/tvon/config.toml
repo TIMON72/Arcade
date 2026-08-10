@@ -1,5 +1,5 @@
 [tvon]
-# HDMI-CEC: автозапуск ТВ при старте Batocera
+# HDMI-CEC: автозапуск ТВ при старте Batocera (поэтапный контроль + recovery)
 enabled = true
 # CEC logical address телевизора (обычно 0)
 device = 0
@@ -23,15 +23,31 @@ settle_sec = 15
 claim_retries = 3
 claim_interval_sec = 3
 # Сколько держать cec-client открытым после as (иначе Active Source сбрасывается)
-claim_hold_sec = 12
+claim_hold_sec = 15
+# После закрытия cec-client: повторный scan Active Source + re-claim если unknown/-1
+active_source_retries = 3
+active_source_recheck_sec = 3
+# Держать CEC-сессию после claim (иначе ТВ сбрасывает Active Source в unknown/-1).
+# Секунды удержания ПОСЛЕ успешного supervise (во время этапов keeper живёт до stop).
+active_source_keep_sec = 120
 # После CEC — batocera-resolution setOutput (чинит чёрный экран после boot без ТВ)
 refresh_display = true
-# Перезапуск PipeWire/audioconfig (иначе после позднего HDMI остаётся Dummy/нет звука)
+# Звук: сначала soft set-profile/set; hard S06 только если нет HDMI sink
 refresh_audio = true
-# Перезапуск EmulationStation после video+audio (ES мог стартовать без экрана/звука)
-restart_es = true
-# Повторы setOutput, пока labwc/Wayland не готовы
+audio_hard_restart = true
+# Безусловный ES restart — last resort на stage picture (опасно на Pi5+NVMe)
+restart_es = false
+# После успешных этапов: ES restart ТОЛЬКО если при старте settled display list был [ ]
+# (медленный ТВ / ES поднялся без HDMI). Быстрый ТВ с уже заполненным списком — skip.
+restart_es_if_empty = true
+es_restart_settle_sec = 8
+# Повторы setOutput / picture / audio stages
 display_retries = 5
 display_retry_sec = 3
+picture_retries = 5
+audio_retries = 3
+# Короткий post-check после stage 4 (картинка не отвалилась)
+post_check_attempts = 2
+post_check_sec = 8
 # Уровень отладки cec-client (-d)
 cec_debug = 1
