@@ -1,15 +1,11 @@
-# Sync local Arcade tree to a Batocera cabinet, then run on-device deploy.
+﻿# Sync local Arcade tree to a Batocera cabinet, then run on-device deploy.
 # Safe path: userdata I/O probe → stop services → /tmp staging → Arcade.new verify →
 # swap → main.py deploy (atomic package replace) → runtime size check → optional restart.
 # Never wipes live runtime before verified staging/checkout.
 # Usage:
 #   .\deploy\deploy.ps1 zero -Update          # освежить: sync + deploy + restart сервисов
 #   .\deploy\deploy.ps1 zero -Update -Full    # то же + wheels/vendor
-#   .\deploy\deploy.ps1 zero -Test            # health: boot 3m + soak 5m, x3 with reboot
-#   .\deploy\deploy.ps1 zero -Update -Test    # sync/deploy/restart, then -Test cycles
-# Probe checks: runtime sizes, main/tvon/ES procs, HDMI DRM, PipeWire HDMI default
-# sink + unmute, batocera audio.device/profile (not auto/Dummy), ES only nes+dreamcast,
-# undervoltage/NVMe I/O alerts.
+#   .\deploy\test.ps1 zero                    # health: boot 5m + alive 5m, x3 with reboot
 #   .\deploy\deploy.ps1 zero
 #   .\deploy\deploy.ps1 zero -Full -Restart
 #   .\deploy\deploy.ps1 zero -NoLogs
@@ -49,9 +45,6 @@ param(
     [switch]$Update,
     [Parameter(ParameterSetName = 'Remote')]
     [switch]$NoLogs,
-    # Boot 3m + soak 5m, reboot, repeat, then final same cycle (3 total).
-    [Parameter(ParameterSetName = 'Remote')]
-    [switch]$Test,
     [Parameter(Mandatory = $true, ParameterSetName = 'PullVenv')]
     [switch]$PullVenv
 )
@@ -607,478 +600,6 @@ function Receive-File {
     throw $lastErr
 }
 
-function Test-TcpPortOpen {
-    param(
-        [string]$HostName,
-        [int]$Port = 22,
-        [int]$TimeoutMs = 800
-    )
-    try {
-        $client = New-Object System.Net.Sockets.TcpClient
-        $iar = $client.BeginConnect($HostName, $Port, $null, $null)
-        $ok = $iar.AsyncWaitHandle.WaitOne($TimeoutMs, $false)
-        if (-not $ok) {
-            $client.Close()
-            return $false
-        }
-        $client.EndConnect($iar)
-        $client.Close()
-        return $true
-    }
-    catch {
-        return $false
-    }
-}
-
-function Invoke-RemoteCapture {
-    param(
-        [string]$SshTarget,
-        $SshBaseArgs,
-        [string]$RemoteCommand,
-        [string]$AskCmd,
-        [int]$ConnectTimeoutSec = 8
-    )
-    # Rebuild args with a short ConnectTimeout + keepalives (detect NVMe/SSH hangs).
-    $filtered = New-Object System.Collections.Generic.List[string]
-    $base = @($SshBaseArgs)
-    for ($i = 0; $i -lt $base.Count; $i++) {
-        $cur = [string]$base[$i]
-        if ($cur -eq '-o' -and ($i + 1) -lt $base.Count) {
-            $next = [string]$base[$i + 1]
-            if ($next -like 'ConnectTimeout=*') {
-                $i++
-                continue
-            }
-        }
-        $filtered.Add($cur) | Out-Null
-    }
-    $argsList = @($filtered) + @(
-        '-o', ('ConnectTimeout=' + $ConnectTimeoutSec),
-        '-o', 'ServerAliveInterval=2',
-        '-o', 'ServerAliveCountMax=2',
-        $SshTarget,
-        $RemoteCommand
-    )
-    $prevAsk = $env:SSH_ASKPASS
-    $prevReq = $env:SSH_ASKPASS_REQUIRE
-    $prevDisp = $env:DISPLAY
-    $prevEa = $ErrorActionPreference
-    $ErrorActionPreference = 'Continue'
-    try {
-        if ($AskCmd) {
-            $env:SSH_ASKPASS = $AskCmd
-            $env:SSH_ASKPASS_REQUIRE = 'force'
-            $env:DISPLAY = '1'
-        }
-        $out = & ssh @argsList 2>&1
-        $code = $LASTEXITCODE
-        $text = (($out | ForEach-Object { "$_" }) -join "`n").TrimEnd()
-        return [pscustomobject]@{
-            Ok       = ($code -eq 0)
-            ExitCode = $code
-            Text     = $text
-        }
-    }
-    finally {
-        $ErrorActionPreference = $prevEa
-        if ($null -eq $prevAsk) {
-            Remove-Item Env:\SSH_ASKPASS -ErrorAction SilentlyContinue
-        }
-        else {
-            $env:SSH_ASKPASS = $prevAsk
-        }
-        if ($null -eq $prevReq) {
-            Remove-Item Env:\SSH_ASKPASS_REQUIRE -ErrorAction SilentlyContinue
-        }
-        else {
-            $env:SSH_ASKPASS_REQUIRE = $prevReq
-        }
-        if ($null -eq $prevDisp) {
-            Remove-Item Env:\DISPLAY -ErrorAction SilentlyContinue
-        }
-        else {
-            $env:DISPLAY = $prevDisp
-        }
-    }
-}
-
-function Get-ArcadeTestProbeScript {
-    return @'
-echo ARCADE_TEST_BEGIN
-FAILS=""
-note_fail() { FAILS="${FAILS}|$1"; }
-
-MAIN=/userdata/system/scripts/main/main.py
-TVON=/userdata/system/scripts/tvon/tvon.py
-PY=/userdata/system/scripts/.venv/bin/python
-AMAIN=/userdata/system/Arcade/scripts/main/main.py
-ATVON=/userdata/system/Arcade/scripts/tvon/tvon.py
-
-SZ_MAIN=$(wc -c < "$MAIN" 2>/dev/null || echo 0)
-SZ_TVON=$(wc -c < "$TVON" 2>/dev/null || echo 0)
-SZ_PY=$(wc -c < "$PY" 2>/dev/null || echo 0)
-SZ_AMAIN=$(wc -c < "$AMAIN" 2>/dev/null || echo 0)
-SZ_ATVON=$(wc -c < "$ATVON" 2>/dev/null || echo 0)
-echo "FILE_MAIN=$SZ_MAIN"
-echo "FILE_TVON=$SZ_TVON"
-echo "FILE_PY=$SZ_PY"
-echo "FILE_ARCADE_MAIN=$SZ_AMAIN"
-echo "FILE_ARCADE_TVON=$SZ_ATVON"
-[ "$SZ_MAIN" -ge 10000 ] || note_fail "runtime_main_tiny"
-[ "$SZ_TVON" -ge 10000 ] || note_fail "runtime_tvon_tiny"
-[ "$SZ_PY" -ge 64 ] || note_fail "venv_python_broken"
-[ "$SZ_AMAIN" -ge 10000 ] || note_fail "arcade_main_tiny"
-[ "$SZ_ATVON" -ge 10000 ] || note_fail "arcade_tvon_tiny"
-
-SVC=$(batocera-services list 2>/dev/null | tr '\n' ' ')
-echo "SERVICES=$SVC"
-echo "$SVC" | grep -q 'main;\*' || note_fail "service_main_off"
-echo "$SVC" | grep -q 'tvon;\*' || note_fail "service_tvon_off"
-
-P_MAIN=$(pgrep -f '/userdata/system/scripts/main/main.py' 2>/dev/null | head -n1)
-P_TVON=$(pgrep -f '/userdata/system/scripts/tvon/tvon.py' 2>/dev/null | head -n1)
-P_ES=$(pgrep -f '[Ee]mulation[Ss]tation' 2>/dev/null | head -n1)
-echo "PID_MAIN=${P_MAIN:-0}"
-echo "PID_TVON=${P_TVON:-0}"
-echo "PID_ES=${P_ES:-0}"
-[ -n "$P_MAIN" ] || note_fail "proc_main"
-[ -n "$P_TVON" ] || note_fail "proc_tvon"
-[ -n "$P_ES" ] || note_fail "proc_emulationstation"
-
-HDMI=""
-for n in HDMI-A-1 HDMI-A-2; do
-  for p in /sys/class/drm/card*-${n}/status; do
-    [ -f "$p" ] || continue
-    st=$(tr -d '\r\n' < "$p" 2>/dev/null || true)
-    echo "DRM_${n}=$st"
-    if [ "$st" = "connected" ]; then HDMI="$n"; fi
-  done
-done
-echo "HDMI=${HDMI:-none}"
-[ -n "$HDMI" ] || note_fail "hdmi_disconnected"
-
-# PipeWire is ground truth on RPi5 (batocera-audio get can lag / stay "auto").
-export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/var/run}"
-AUDIO_CUR=$(batocera-audio get 2>/dev/null | tr -d '\r' | head -n1)
-AUDIO_LIST=$(batocera-audio list 2>/dev/null | tr '\n' ';' | tr -d '\r')
-AUDIO_PROFILE=$(batocera-settings-get audio.profile 2>/dev/null | tr -d '\r' | head -n1)
-AUDIO_DEVICE=$(batocera-settings-get audio.device 2>/dev/null | tr -d '\r' | head -n1)
-PACTL_DEFAULT=$(pactl get-default-sink 2>/dev/null | tr -d '\r' | head -n1)
-PACTL_MUTE=$(pactl get-sink-mute @DEFAULT_SINK@ 2>/dev/null | awk '{print $2}' | tr -d '\r')
-echo "AUDIO_GET=${AUDIO_CUR:-}"
-echo "AUDIO_DEVICE=${AUDIO_DEVICE:-}"
-echo "AUDIO_PROFILE=${AUDIO_PROFILE:-}"
-echo "AUDIO_LIST=${AUDIO_LIST:-}"
-echo "PACTL_DEFAULT=${PACTL_DEFAULT:-}"
-echo "PACTL_MUTE=${PACTL_MUTE:-}"
-
-# Must have a real HDMI sink listed (not only Dummy).
-echo "$AUDIO_LIST" | grep -qi 'hdmi' || note_fail "no_hdmi_sink_listed"
-case "${PACTL_DEFAULT}" in
-  ""|*auto_null*) note_fail "pactl_default_null_or_empty" ;;
-esac
-echo "${PACTL_DEFAULT}" | grep -qi 'hdmi' || note_fail "pactl_default_not_hdmi"
-[ "${PACTL_MUTE:-yes}" = "no" ] || note_fail "audio_muted"
-
-# Persisted Batocera settings should target HDMI (cold-boot S27 path).
-case "${AUDIO_DEVICE}" in
-  ""|auto|auto_null) note_fail "audio_device_auto_or_empty" ;;
-esac
-echo "${AUDIO_DEVICE}" | grep -qi 'hdmi' || note_fail "audio_device_not_hdmi"
-echo "${AUDIO_PROFILE}" | grep -qi 'hdmi' || note_fail "audio_profile_not_hdmi"
-
-# TVON knobs deployed (soft-wait + hotplug suppress).
-TVON_CFG=/userdata/system/scripts/tvon/config.toml
-if [ -f "$TVON_CFG" ]; then
-  grep -q 'audio_soft_wait_sec' "$TVON_CFG" || note_fail "tvon_cfg_missing_soft_wait"
-  grep -q 'hotplug_suppress_sec' "$TVON_CFG" || note_fail "tvon_cfg_missing_hotplug_suppress"
-else
-  note_fail "tvon_cfg_missing"
-fi
-
-# ES: only dreamcast + nes visible (HiddenSystems).
-if [ -n "$P_ES" ]; then
-  VIS=$(curl -sS --max-time 3 http://127.0.0.1:1234/systems 2>/dev/null | python3 -c '
-import sys, json
-try:
-    data = json.load(sys.stdin)
-except Exception:
-    print("ERR"); raise SystemExit(0)
-names = []
-for s in data:
-    if str(s.get("visible")).lower() != "true":
-        continue
-    if str(s.get("collection")).lower() == "true":
-        continue
-    names.append(s.get("name") or "")
-print(",".join(sorted(names)))
-' 2>/dev/null | tr -d '\r')
-  echo "ES_VISIBLE=${VIS:-}"
-  case "${VIS}" in
-    ""|ERR) note_fail "es_systems_api_fail" ;;
-    dreamcast,nes|nes,dreamcast) ;;
-    *) note_fail "es_visible_not_nes_dreamcast_only" ;;
-  esac
-fi
-
-TH=$(vcgencmd get_throttled 2>/dev/null | tr -d '\r')
-echo "THROTTLED=${TH:-}"
-HEX=$(echo "$TH" | sed -n 's/.*throttled=0x\([0-9a-fA-F]*\).*/\1/p')
-if [ -n "$HEX" ]; then
-  VAL=$(printf '%d' "0x$HEX" 2>/dev/null || echo 0)
-  CUR_UV=$((VAL & 1))
-  [ "$CUR_UV" -eq 0 ] || note_fail "undervoltage_now"
-fi
-
-DMESG=$(dmesg 2>/dev/null | grep -Ei 'controller is down|I/O error|Under-voltage detected' | tail -n 8 | tr '\n' ';' | tr -d '\r')
-echo "DMESG_ALERTS=${DMESG:-}"
-echo "$DMESG" | grep -qi 'controller is down' && note_fail "nvme_controller_down"
-echo "$DMESG" | grep -qi 'I/O error' && note_fail "io_error"
-echo "$DMESG" | grep -qi 'Under-voltage detected' && note_fail "undervoltage_dmesg"
-
-CMDLINE=$(tr -d '\r' < /boot/cmdline.txt 2>/dev/null || true)
-echo "CMDLINE=$CMDLINE"
-echo "$CMDLINE" | grep -q 'nvme_core.default_ps_max_latency_us=0' || note_fail "cmdline_missing_nvme_ps"
-echo "$CMDLINE" | grep -q 'pcie_aspm=off' || note_fail "cmdline_missing_aspm_off"
-
-UP=$(uptime 2>/dev/null | tr -d '\r')
-echo "UPTIME=$UP"
-if [ -z "$FAILS" ]; then
-  echo ARCADE_TEST_OK=1
-else
-  echo "ARCADE_TEST_OK=0"
-  echo "ARCADE_TEST_FAILS=${FAILS#|}"
-fi
-echo ARCADE_TEST_END
-'@
-}
-
-function Invoke-ArcadeHealthProbe {
-    param(
-        [string]$SshTarget,
-        $SshBaseArgs,
-        [string]$AskCmd,
-        [string]$HostName,
-        [int]$ConnectTimeoutSec = 8
-    )
-    $ping = Test-Connection -ComputerName $HostName -Count 1 -Quiet -ErrorAction SilentlyContinue
-    $tcp = Test-TcpPortOpen -HostName $HostName -Port 22 -TimeoutMs 800
-    if (-not $ping -or -not $tcp) {
-        return [pscustomobject]@{
-            Ok       = $false
-            SshOk    = $false
-            Failures = @('ssh_unreachable')
-            Detail   = ('ping=' + $ping + ' tcp22=' + $tcp)
-            Text     = ''
-        }
-    }
-    $script = Get-ArcadeTestProbeScript
-    $script = ($script -replace "`r`n", "`n" -replace "`r", "`n")
-    if (-not $script.EndsWith("`n")) { $script += "`n" }
-    $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($script))
-    $cmd = "echo $b64 | base64 -d | sh"
-    $cap = Invoke-RemoteCapture -SshTarget $SshTarget -SshBaseArgs $SshBaseArgs -RemoteCommand $cmd -AskCmd $AskCmd -ConnectTimeoutSec $ConnectTimeoutSec
-    if (-not $cap.Ok -or $cap.Text -notmatch 'ARCADE_TEST_END') {
-        $pat = if ($ping -and $tcp) { 'ping+22/SSH-stuck' } else { 'ssh_fail' }
-        return [pscustomobject]@{
-            Ok       = $false
-            SshOk    = $false
-            Failures = @($pat)
-            Detail   = ('exit=' + $cap.ExitCode)
-            Text     = $cap.Text
-        }
-    }
-    $fails = @()
-    if ($cap.Text -match 'ARCADE_TEST_FAILS=(\S+)') {
-        $fails = @($Matches[1].Split('|') | Where-Object { $_ })
-    }
-    $ok = ($cap.Text -match 'ARCADE_TEST_OK=1') -and ($fails.Count -eq 0)
-    $summary = @()
-    foreach ($key in @('HDMI=', 'PACTL_DEFAULT=', 'AUDIO_DEVICE=', 'AUDIO_PROFILE=', 'ES_VISIBLE=', 'THROTTLED=', 'PID_MAIN=', 'PID_TVON=', 'PID_ES=', 'FILE_PY=')) {
-        $line = ($cap.Text -split "`n" | Where-Object { $_ -like ($key + '*') } | Select-Object -First 1)
-        if ($line) { $summary += $line.Trim() }
-    }
-    return [pscustomobject]@{
-        Ok       = [bool]$ok
-        SshOk    = $true
-        Failures = $fails
-        Detail   = ($summary -join ' | ')
-        Text     = $cap.Text
-    }
-}
-
-function Write-ArcadeTestLog {
-    param([string]$Message)
-    Write-Host ('[{0}] {1}' -f (Get-Date -Format 'HH:mm:ss'), $Message)
-}
-
-function Wait-ArcadeBootWindow {
-    param(
-        [string]$Label,
-        [string]$SshTarget,
-        $SshBaseArgs,
-        [string]$AskCmd,
-        [string]$HostName,
-        [int]$Seconds = 180,
-        [int]$IntervalSec = 10
-    )
-    Write-ArcadeTestLog ("$Label : boot monitor ${Seconds}s")
-    $deadline = (Get-Date).AddSeconds($Seconds)
-    $n = 0
-    $everOk = $false
-    $lastFail = 'not_probed'
-    while ((Get-Date) -lt $deadline) {
-        $n++
-        $probe = Invoke-ArcadeHealthProbe -SshTarget $SshTarget -SshBaseArgs $SshBaseArgs -AskCmd $AskCmd -HostName $HostName
-        if ($probe.Ok) {
-            $everOk = $true
-            Write-ArcadeTestLog ("$Label boot #$n OK | " + $probe.Detail)
-        }
-        else {
-            $lastFail = if ($probe.Failures.Count) { ($probe.Failures -join ',') } else { $probe.Detail }
-            # Boot may flap (HDMI/audio settle); only require healthy before deadline.
-            Write-ArcadeTestLog ("$Label boot #$n WAIT ($lastFail) | " + $probe.Detail)
-        }
-        $remain = [int][math]::Ceiling(($deadline - (Get-Date)).TotalSeconds)
-        if ($remain -le 0) { break }
-        Start-Sleep -Seconds ([math]::Min($IntervalSec, $remain))
-    }
-    $final = Invoke-ArcadeHealthProbe -SshTarget $SshTarget -SshBaseArgs $SshBaseArgs -AskCmd $AskCmd -HostName $HostName
-    if (-not $final.Ok) {
-        $why = if ($final.Failures.Count) { ($final.Failures -join ',') } else { $final.Detail }
-        if (-not $everOk) {
-            throw ("$Label boot monitor failed: never healthy within ${Seconds}s (last=$why)")
-        }
-        throw ("$Label boot monitor end-check failed: $why")
-    }
-    Write-ArcadeTestLog ("$Label : boot OK")
-}
-
-function Wait-ArcadeSoakWindow {
-    param(
-        [string]$Label,
-        [string]$SshTarget,
-        $SshBaseArgs,
-        [string]$AskCmd,
-        [string]$HostName,
-        [int]$Seconds = 300,
-        [int]$IntervalSec = 15
-    )
-    Write-ArcadeTestLog ("$Label : soak ${Seconds}s (screen/sound/services)")
-    $deadline = (Get-Date).AddSeconds($Seconds)
-    $n = 0
-    while ((Get-Date) -lt $deadline) {
-        $n++
-        $probe = Invoke-ArcadeHealthProbe -SshTarget $SshTarget -SshBaseArgs $SshBaseArgs -AskCmd $AskCmd -HostName $HostName
-        if (-not $probe.Ok) {
-            $why = if ($probe.Failures.Count) { ($probe.Failures -join ',') } else { $probe.Detail }
-            Write-ArcadeTestLog ("$Label soak #$n FAIL ($why)")
-            if ($probe.Text) {
-                Write-Host $probe.Text
-            }
-            throw ("$Label soak failed at probe #$n : $why")
-        }
-        Write-ArcadeTestLog ("$Label soak #$n OK | " + $probe.Detail)
-        $remain = [int][math]::Ceiling(($deadline - (Get-Date)).TotalSeconds)
-        if ($remain -le 0) { break }
-        Start-Sleep -Seconds ([math]::Min($IntervalSec, $remain))
-    }
-    Write-ArcadeTestLog ("$Label : soak OK")
-}
-
-function Invoke-ArcadeRemoteReboot {
-    param(
-        [string]$SshTarget,
-        $SshBaseArgs,
-        [string]$AskCmd,
-        [string]$HostName,
-        [int]$OfflineWaitSec = 180,
-        [int]$OnlineWaitSec = 300
-    )
-    Write-ArcadeTestLog 'REBOOT: requesting remote reboot'
-    $rebootCmd = 'nohup sh -c "sleep 1; sync; reboot -f" >/dev/null 2>&1 &'
-    try {
-        Invoke-RemoteCapture -SshTarget $SshTarget -SshBaseArgs $SshBaseArgs -RemoteCommand $rebootCmd -AskCmd $AskCmd -ConnectTimeoutSec 8 | Out-Null
-    }
-    catch {
-        # SSH drop during reboot is expected.
-    }
-
-    $offDeadline = (Get-Date).AddSeconds($OfflineWaitSec)
-    $sawOffline = $false
-    while ((Get-Date) -lt $offDeadline) {
-        $ping = Test-Connection -ComputerName $HostName -Count 1 -Quiet -ErrorAction SilentlyContinue
-        $tcp = Test-TcpPortOpen -HostName $HostName -Port 22 -TimeoutMs 700
-        if (-not $ping -and -not $tcp) {
-            $sawOffline = $true
-            Write-ArcadeTestLog 'REBOOT: offline'
-            break
-        }
-        Start-Sleep -Seconds 2
-    }
-    if (-not $sawOffline) {
-        throw 'REBOOT: machine did not go offline (reboot failed or hung before drop)'
-    }
-
-    Start-Sleep -Seconds 5
-    $onDeadline = (Get-Date).AddSeconds($OnlineWaitSec)
-    $n = 0
-    while ((Get-Date) -lt $onDeadline) {
-        $n++
-        $ping = Test-Connection -ComputerName $HostName -Count 1 -Quiet -ErrorAction SilentlyContinue
-        $tcp = Test-TcpPortOpen -HostName $HostName -Port 22 -TimeoutMs 800
-        if ($ping -and $tcp) {
-            $hello = Invoke-RemoteCapture -SshTarget $SshTarget -SshBaseArgs $SshBaseArgs -RemoteCommand 'echo REBOOT_UP; uptime' -AskCmd $AskCmd -ConnectTimeoutSec 8
-            if ($hello.Ok -and $hello.Text -match 'REBOOT_UP') {
-                Write-ArcadeTestLog ('REBOOT: SSH back (' + ($hello.Text -replace "`n", ' ') + ')')
-                return
-            }
-            Write-ArcadeTestLog ("REBOOT: ping+22 but SSH not ready (#$n)")
-        }
-        else {
-            if ($n % 5 -eq 1) {
-                Write-ArcadeTestLog ("REBOOT: waiting online ping=$ping tcp=$tcp")
-            }
-        }
-        Start-Sleep -Seconds 3
-    }
-    throw 'REBOOT: timed out waiting for SSH after reboot'
-}
-
-function Invoke-ArcadeCabinetTest {
-    param(
-        [string]$SshTarget,
-        $SshBaseArgs,
-        [string]$AskCmd,
-        [string]$HostName
-    )
-    $cycles = @(
-        @{ Name = 'cycle1'; DoRebootBefore = $false },
-        @{ Name = 'cycle2'; DoRebootBefore = $true },
-        @{ Name = 'final'; DoRebootBefore = $true }
-    )
-    Write-Host ''
-    Write-Host '========== ARCADE TEST =========='
-    Write-Host 'boot 3m + soak 5m, then reboot + repeat, then final same cycle'
-    Write-Host '================================='
-    $i = 0
-    foreach ($cycle in $cycles) {
-        $i++
-        $label = [string]$cycle.Name
-        Write-Host ''
-        Write-ArcadeTestLog ("===== $label ($i/$($cycles.Count)) =====")
-        if ($cycle.DoRebootBefore) {
-            Invoke-ArcadeRemoteReboot -SshTarget $SshTarget -SshBaseArgs $SshBaseArgs -AskCmd $AskCmd -HostName $HostName
-        }
-        Wait-ArcadeBootWindow -Label $label -SshTarget $SshTarget -SshBaseArgs $SshBaseArgs -AskCmd $AskCmd -HostName $HostName -Seconds 180 -IntervalSec 10
-        Wait-ArcadeSoakWindow -Label $label -SshTarget $SshTarget -SshBaseArgs $SshBaseArgs -AskCmd $AskCmd -HostName $HostName -Seconds 300 -IntervalSec 15
-        Write-ArcadeTestLog ("$label : PASS")
-    }
-    Write-Host ''
-    Write-ArcadeTestLog 'RESULT: ALL CYCLES PASSED'
-}
-
-
 if (-not $RepoRoot) {
     $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 }
@@ -1157,10 +678,6 @@ $sshBaseArgs = @(
 Write-Host ('-> target ' + $sshTarget)
 Write-Host ('-> remote ' + $RemotePath)
 Write-Host ('-> repo   ' + $RepoRoot)
-if ($Test) {
-    $NoLogs = $true
-    Write-Host '-> Test: boot 3m + soak 5m x3 (with reboot between cycles); logs disabled'
-}
 if ($Update) {
     if ($NoDeploy) {
         throw '-Update cannot be combined with -NoDeploy (Update always runs on-device deploy).'
@@ -1171,7 +688,6 @@ if ($Update) {
 Write-Host '... password auth'
 
 $askCmd = New-AskPassScript -Text $Auth
-$testOnly = $Test -and -not $Update -and -not $Full -and -not $Restart -and -not $NoDeploy
 
 if ($PSCmdlet.ParameterSetName -eq 'PullVenv') {
     $remoteTmp = '/tmp/arcade-venv-' + $PID + '.tar.gz'
@@ -1261,11 +777,6 @@ if ($Full) {
 
 $syncedOk = $false
 try {
-    if ($testOnly) {
-        Write-Host '-> Test-only: skip sync/deploy (use -Update/-Full/-Restart with -Test to sync first)'
-        $syncedOk = $true
-    }
-    else {
     Write-Host ('... packing (Full=' + $Full + ')...')
     # ustar: safer across Windows OpenSSH tar ↔ Batocera GNU/BusyBox tar
     & tar --format=ustar -cf $tarPath @excludeArgs -C $RepoRoot .
@@ -1437,23 +948,10 @@ batocera-services restart main timer server tvon || true
         Write-Host ('  Next: Cursor Remote-SSH -> ' + $sshTarget + ' -> open ' + $RemotePath + ' -> F5 Arcade')
     }
     $syncedOk = $true
-    } # end sync branch
 }
 finally {
     Remove-Item -LiteralPath $tarPath -Force -ErrorAction SilentlyContinue
-    if (-not ($syncedOk -and $Test)) {
-        Remove-Item -LiteralPath $askCmd -Force -ErrorAction SilentlyContinue
-    }
-}
-
-if ($syncedOk -and $Test) {
-    try {
-        Invoke-ArcadeCabinetTest -SshTarget $sshTarget -SshBaseArgs $sshBaseArgs -AskCmd $askCmd -HostName $cabinetHost
-    }
-    finally {
-        Remove-Item -LiteralPath $askCmd -Force -ErrorAction SilentlyContinue
-    }
-    exit 0
+    Remove-Item -LiteralPath $askCmd -Force -ErrorAction SilentlyContinue
 }
 
 if ($syncedOk -and -not $NoLogs) {
