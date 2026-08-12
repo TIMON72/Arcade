@@ -5,9 +5,21 @@ SCRIPT="$ROOT/main/main.py"
 ARCADE="/userdata/system/Arcade"
 PIDFILE="/var/run/main-service.pid"
 LOG="/userdata/system/logs/main-service.log"
-PYTHON="$ROOT/.venv/bin/python"
-[ -x "$PYTHON" ] || PYTHON="$ROOT/venv/bin/python"
-[ -x "$PYTHON" ] || PYTHON="python3"
+# Prefer venv only if python is executable and non-empty (0-byte stubs break start).
+pick_python() {
+    local cand sz
+    for cand in "$ROOT/.venv/bin/python" "$ROOT/venv/bin/python"; do
+        if [ -x "$cand" ]; then
+            sz=$(wc -c < "$cand" 2>/dev/null || echo 0)
+            if [ "$sz" -ge 64 ]; then
+                echo "$cand"
+                return 0
+            fi
+        fi
+    done
+    echo "python3"
+}
+PYTHON="$(pick_python)"
 
 GIT_ROOT="/userdata/system/git"
 GIT_LINKS="git git-shell git-receive-pack git-upload-pack git-upload-archive"
@@ -32,21 +44,37 @@ ensure_git_links() {
     fi
 }
 
-# Если рабочей копии ещё нет — один раз задеплоить из /userdata/system/Arcade
+# Если рабочей копии нет или файлы пустые (0 байт после ребута без fsync) —
+# задеплоить из /userdata/system/Arcade.
 bootstrap_from_arcade() {
-    if [ -f "$SCRIPT" ]; then
+    runtime_ok() {
+        local f="$1"
+        local min="${2:-1000}"
+        [ -f "$f" ] || return 1
+        local sz
+        sz=$(wc -c < "$f" 2>/dev/null || echo 0)
+        [ "$sz" -ge "$min" ]
+    }
+
+    if runtime_ok "$SCRIPT" 1000 \
+        && runtime_ok "$ROOT/tvon/tvon.py" 1000 \
+        && runtime_ok "$ROOT/timer/timer.py" 500 \
+        && runtime_ok "$ROOT/server/server.py" 500; then
         return 0
     fi
-    if [ ! -f "$ARCADE/scripts/main/main.py" ]; then
-        echo "main: missing $SCRIPT and $ARCADE — run Arcade/install" >&2
+    if ! runtime_ok "$ARCADE/scripts/main/main.py" 1000; then
+        echo "main: missing healthy $SCRIPT and $ARCADE — run Arcade/install" >&2
         return 1
     fi
     mkdir -p "$(dirname "$LOG")"
-    echo "main: bootstrapping deploy from $ARCADE ..."
+    echo "main: healing runtime from $ARCADE (missing/empty scripts)..."
     python3 "$ARCADE/scripts/main/main.py" deploy >>"$LOG" 2>&1 || return 1
-    PYTHON="$ROOT/.venv/bin/python"
-    [ -x "$PYTHON" ] || PYTHON="$ROOT/venv/bin/python"
-    [ -x "$PYTHON" ] || PYTHON="python3"
+    sync || true
+    if ! runtime_ok "$SCRIPT" 1000; then
+        echo "main: heal failed — $SCRIPT still empty/missing" >&2
+        return 1
+    fi
+    PYTHON="$(pick_python)"
 }
 
 start() {

@@ -14,9 +14,11 @@ import shutil
 import subprocess
 import sys
 import threading
-import tomllib
-from dataclasses import dataclass
 import time
+import tomllib
+from contextlib import contextmanager
+from dataclasses import dataclass
+from typing import Iterator
 
 _TVON_DIR = os.path.dirname(os.path.abspath(__file__))
 _SCRIPTS_ROOT = os.path.dirname(_TVON_DIR)
@@ -60,6 +62,13 @@ class TvonConfig:
     refresh_display: bool = True
     refresh_audio: bool = True
     audio_hard_restart: bool = True
+    # How long to keep soft set-profile/set before escalating to S06 restart.
+    # Hard only after this wait still has no HDMI sink / soft set failed.
+    audio_soft_wait_sec: int = 45
+    # While setOutput / S06audio restart may emit DRM HOTPLUG, keep recreating
+    # Batocera's /tmp/no-hotplug so switch-screen-checker skips curl /quit
+    # (does not change udev rules — uses existing Batocera escape hatch).
+    hotplug_suppress_sec: int = 20
     # Unconditional ES restart last resort on stage picture (risky on Pi5+NVMe).
     restart_es: bool = False
     # After stages OK: restart ES only if it launched with settled display list [ ].
@@ -68,7 +77,7 @@ class TvonConfig:
     display_retries: int = 5
     display_retry_sec: int = 3
     picture_retries: int = 5
-    audio_retries: int = 3
+    audio_retries: int = 2
     post_check_attempts: int = 2
     post_check_sec: int = 8
     cec_debug: int = 1
@@ -154,6 +163,12 @@ def load_tvon_config() -> TvonConfig:
         refresh_audio=_read_bool(section, "refresh_audio", defaults.refresh_audio),
         audio_hard_restart=_read_bool(
             section, "audio_hard_restart", defaults.audio_hard_restart
+        ),
+        audio_soft_wait_sec=_read_non_negative_int(
+            section, "audio_soft_wait_sec", defaults.audio_soft_wait_sec
+        ),
+        hotplug_suppress_sec=_read_non_negative_int(
+            section, "hotplug_suppress_sec", defaults.hotplug_suppress_sec
         ),
         restart_es=_read_bool(section, "restart_es", defaults.restart_es),
         restart_es_if_empty=_read_bool(
@@ -742,6 +757,59 @@ def _display_env() -> dict[str, str]:
     return env
 
 
+_BATOCERA_NO_HOTPLUG = "/tmp/no-hotplug"
+
+
+@contextmanager
+def suppress_batocera_hotplug_quit(hold_sec: float) -> Iterator[None]:
+    """
+    Batocera's batocera-switch-screen-checker skips one DRM hotplug when
+    /tmp/no-hotplug exists (then deletes the file). setOutput / PipeWire
+    restart can emit several HOTPLUG events, so pulse the file for hold_sec.
+    Does not modify udev or other Batocera system files.
+    """
+    if hold_sec <= 0:
+        yield
+        return
+
+    stop = threading.Event()
+
+    def _pulse() -> None:
+        while not stop.is_set():
+            try:
+                with open(_BATOCERA_NO_HOTPLUG, "a", encoding="utf-8"):
+                    pass
+            except OSError:
+                pass
+            stop.wait(0.4)
+
+    try:
+        with open(_BATOCERA_NO_HOTPLUG, "a", encoding="utf-8"):
+            pass
+    except OSError as error:
+        log(f"TVON: cannot create {_BATOCERA_NO_HOTPLUG}: {error}")
+        yield
+        return
+
+    log(f"TVON: hotplug-quit suppress on ({hold_sec:.0f}s via {_BATOCERA_NO_HOTPLUG})")
+    thread = threading.Thread(
+        target=_pulse, name="tvon-no-hotplug", daemon=True
+    )
+    thread.start()
+    try:
+        yield
+    finally:
+        # batocera-switch-screen-checker-delayed sleeps ~2s; cover trailing events
+        time.sleep(min(4.0, hold_sec))
+        stop.set()
+        thread.join(timeout=2.0)
+        try:
+            os.remove(_BATOCERA_NO_HOTPLUG)
+        except OSError:
+            pass
+        log("TVON: hotplug-quit suppress off")
+
+
 def refresh_batocera_output(tvon: TvonConfig, preferred: str | None) -> str | None:
     """После boot без ТВ ES часто без выхода — setOutput на живой HDMI."""
     tool = shutil.which("batocera-resolution")
@@ -760,33 +828,34 @@ def refresh_batocera_output(tvon: TvonConfig, preferred: str | None) -> str | No
             ordered.append(name)
 
     env = _display_env()
-    for attempt in range(1, tvon.display_retries + 1):
-        for output in ordered:
-            log(
-                f"TVON: refresh display setOutput {output} "
-                f"({attempt}/{tvon.display_retries})"
-            )
-            try:
-                result = subprocess.run(
-                    [tool, "setOutput", output],
-                    capture_output=True,
-                    text=True,
-                    timeout=60,
-                    check=False,
-                    env=env,
-                )
-                if result.returncode == 0:
-                    log(f"TVON: setOutput ok ({output})")
-                    return output
-                err = ((result.stdout or "") + (result.stderr or "")).strip()[:200]
+    with suppress_batocera_hotplug_quit(float(tvon.hotplug_suppress_sec)):
+        for attempt in range(1, tvon.display_retries + 1):
+            for output in ordered:
                 log(
-                    f"TVON: setOutput {output} failed rc={result.returncode} "
-                    f"{err or '(no output — often no WAYLAND_DISPLAY)'}"
+                    f"TVON: refresh display setOutput {output} "
+                    f"({attempt}/{tvon.display_retries})"
                 )
-            except (OSError, subprocess.TimeoutExpired) as error:
-                log(f"TVON: setOutput {output} ERROR {error}")
-        if attempt < tvon.display_retries:
-            time.sleep(tvon.display_retry_sec)
+                try:
+                    result = subprocess.run(
+                        [tool, "setOutput", output],
+                        capture_output=True,
+                        text=True,
+                        timeout=60,
+                        check=False,
+                        env=env,
+                    )
+                    if result.returncode == 0:
+                        log(f"TVON: setOutput ok ({output})")
+                        return output
+                    err = ((result.stdout or "") + (result.stderr or "")).strip()[:200]
+                    log(
+                        f"TVON: setOutput {output} failed rc={result.returncode} "
+                        f"{err or '(no output — often no WAYLAND_DISPLAY)'}"
+                    )
+                except (OSError, subprocess.TimeoutExpired) as error:
+                    log(f"TVON: setOutput {output} ERROR {error}")
+            if attempt < tvon.display_retries:
+                time.sleep(tvon.display_retry_sec)
     return None
 
 
@@ -819,6 +888,31 @@ def _audio_card_for_output(hdmi_output: str | None) -> str | None:
     return _HDMI_TO_CARD.get(hdmi_output)
 
 
+def _pactl(*args: str, timeout: float = 20) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["pactl", *args],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=False,
+        env=_display_env(),
+    )
+
+
+def _default_sink() -> str | None:
+    try:
+        result = _pactl("get-default-sink")
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    name = (result.stdout or "").strip()
+    return name or None
+
+
+def _is_hdmi_sink_id(sink_id: str) -> bool:
+    low = sink_id.lower()
+    return "hdmi" in low and sink_id not in {"auto", "auto_null"}
+
+
 def _pick_hdmi_sink(prefer_card: str | None = None) -> str | None:
     tool = shutil.which("batocera-audio")
     if not tool:
@@ -841,7 +935,7 @@ def _pick_hdmi_sink(prefer_card: str | None = None) -> str | None:
             continue
         sink_id, _desc = line.split("\t", 1)
         sink_id = sink_id.strip()
-        if "hdmi" in sink_id.lower() and sink_id not in {"auto", "auto_null"}:
+        if _is_hdmi_sink_id(sink_id):
             hdmi_sinks.append(sink_id)
 
     if prefer_card:
@@ -851,41 +945,123 @@ def _pick_hdmi_sink(prefer_card: str | None = None) -> str | None:
     return hdmi_sinks[0] if hdmi_sinks else None
 
 
+def _score_hdmi_profile(profile_id: str, prefer_card: str | None) -> tuple[int, str]:
+    """Higher score = better. Reject pro-audio@...hdmi_sound paths."""
+    low = profile_id.lower()
+    is_hdmi_out = (
+        "hdmi-stereo" in low
+        or "hdmi-surround" in low
+        or low.startswith("output:hdmi")
+    )
+    if not is_hdmi_out:
+        return (-1, profile_id)
+    score = 10
+    if "hdmi-stereo" in low:
+        score += 20
+    if prefer_card and prefer_card in low:
+        score += 50
+    return (score, profile_id)
+
+
 def _pick_hdmi_profile(prefer_card: str | None = None) -> str | None:
+    """Prefer batocera-audio list-profiles; fall back to pactl (incl. unavailable)."""
+    candidates: list[str] = []
     tool = shutil.which("batocera-audio")
-    if not tool:
-        return None
+    if tool:
+        try:
+            result = subprocess.run(
+                [tool, "list-profiles"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+                env=_display_env(),
+            )
+            for line in (result.stdout or "").splitlines():
+                if not line.strip() or "\t" not in line:
+                    continue
+                profile_id, _desc = line.split("\t", 1)
+                candidates.append(profile_id.strip())
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+    if not candidates:
+        # batocera list-profiles only shows available=1; on cold boot HDMI
+        # profiles often exist but are still available=0 until nudged.
+        try:
+            raw = _pactl("list", "cards-profiles-raw")
+            for line in (raw.stdout or "").splitlines():
+                # card="N" name="CARD" profile="PROF" available="0|1" ...
+                m = re.search(
+                    r'name="([^"]+)"\s+profile="([^"]+)"',
+                    line,
+                )
+                if not m:
+                    continue
+                card_name, profile_name = m.group(1), m.group(2)
+                candidates.append(f"{profile_name}@{card_name}")
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+    best: tuple[int, str] | None = None
+    for profile_id in candidates:
+        score, pid = _score_hdmi_profile(profile_id, prefer_card)
+        if score < 0:
+            continue
+        if best is None or score > best[0]:
+            best = (score, pid)
+    return best[1] if best else None
+
+
+def _set_card_profile_direct(profile: str) -> bool:
+    """pactl set-card-profile even when batocera-audio still hides the profile."""
+    if "@" not in profile:
+        return False
+    profile_name, card_name = profile.split("@", 1)
     try:
-        result = subprocess.run(
-            [tool, "list-profiles"],
+        result = _pactl("set-card-profile", card_name, profile_name)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        log(f"TVON: pactl set-card-profile ERROR {error}")
+        return False
+    if result.returncode != 0:
+        err = ((result.stdout or "") + (result.stderr or "")).strip()[:160]
+        log(f"TVON: pactl set-card-profile failed rc={result.returncode} {err}")
+        return False
+    return True
+
+
+def _persist_audio_selection(sink: str, profile: str | None) -> None:
+    """
+    batocera-audio set/get do not write batocera.conf. Persist so S27 can
+    re-apply HDMI after PipeWire restarts (auto is a no-op on RPi5).
+    """
+    setter = shutil.which("batocera-settings-set")
+    if not setter:
+        return
+    try:
+        subprocess.run(
+            [setter, "audio.device", sink],
             capture_output=True,
             text=True,
-            timeout=30,
+            timeout=15,
             check=False,
             env=_display_env(),
         )
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-
-    stereo_preferred = None
-    stereo_any = None
-    any_hdmi = None
-    for line in (result.stdout or "").splitlines():
-        if not line.strip() or "\t" not in line:
-            continue
-        profile_id, _desc = line.split("\t", 1)
-        profile_id = profile_id.strip()
-        low = profile_id.lower()
-        if "hdmi" not in low:
-            continue
-        if any_hdmi is None:
-            any_hdmi = profile_id
-        if "hdmi-stereo" in low:
-            if prefer_card and prefer_card in low:
-                stereo_preferred = profile_id
-            elif stereo_any is None:
-                stereo_any = profile_id
-    return stereo_preferred or stereo_any or any_hdmi
+        if profile:
+            subprocess.run(
+                [setter, "audio.profile", profile],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+                env=_display_env(),
+            )
+        log(
+            f"TVON: persisted audio.device + "
+            f"audio.profile={profile or '(unchanged)'}"
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        log(f"TVON: persist audio settings ERROR {error}")
 
 
 def _apply_hdmi_audio(
@@ -893,6 +1069,8 @@ def _apply_hdmi_audio(
     *,
     attempts: int = 5,
     allow_audio_start: bool = True,
+    settle_sec: float = 1.0,
+    retry_sec: float = 2.0,
 ) -> bool:
     """Профиль + sink HDMI через batocera-audio (без обязательного S06 restart)."""
     tool = shutil.which("batocera-audio")
@@ -902,12 +1080,14 @@ def _apply_hdmi_audio(
 
     env = _display_env()
     last_err = ""
+    last_profile: str | None = None
     for attempt in range(1, attempts + 1):
-        time.sleep(2 if attempt > 1 else 1)
+        time.sleep(settle_sec if attempt == 1 else retry_sec)
         profile = _pick_hdmi_profile(prefer_card)
         if profile:
+            last_profile = profile
             log(f"TVON: set-profile {profile} (try {attempt}/{attempts})")
-            subprocess.run(
+            sp = subprocess.run(
                 [tool, "set-profile", profile],
                 capture_output=True,
                 text=True,
@@ -915,11 +1095,19 @@ def _apply_hdmi_audio(
                 check=False,
                 env=env,
             )
+            if sp.returncode != 0:
+                # Cold boot: profile may be available=0 → batocera-audio refuses.
+                if _set_card_profile_direct(profile):
+                    log("TVON: set-profile via pactl ok")
+                else:
+                    log(f"TVON: set-profile failed rc={sp.returncode}")
+        else:
+            log(f"TVON: no HDMI profile yet (try {attempt}/{attempts})")
 
         sink = _pick_hdmi_sink(prefer_card)
         if not sink:
             log(f"TVON: no HDMI sink yet (try {attempt}/{attempts})")
-            if allow_audio_start and attempt == max(3, attempts // 2):
+            if allow_audio_start and attempt == max(2, attempts // 2):
                 # PipeWire мог не подняться после restart — ещё один старт
                 _run_init_script("S06audio", "start", timeout=90)
                 time.sleep(2)
@@ -935,21 +1123,48 @@ def _apply_hdmi_audio(
             check=False,
             env=env,
         )
-        if result.returncode == 0:
-            vol = subprocess.run(
-                [tool, "setSystemVolume", "100"],
-                capture_output=True,
-                text=True,
-                timeout=15,
-                check=False,
-                env=env,
-            )
-            if vol.returncode != 0:
-                log("TVON: setSystemVolume 100 failed (non-fatal)")
-            log("TVON: audio HDMI ok")
-            return True
-        last_err = ((result.stdout or "") + (result.stderr or "")).strip()[:200]
-        log(f"TVON: audio set failed rc={result.returncode} {last_err}")
+        default = _default_sink()
+        if result.returncode != 0 or default != sink:
+            # batocera-audio set can "succeed" oddly; force default sink.
+            try:
+                forced = _pactl("set-default-sink", sink)
+                default = _default_sink()
+                if forced.returncode != 0 or default != sink:
+                    last_err = (
+                        ((result.stdout or "") + (result.stderr or "")).strip()[:200]
+                        or f"default={default or 'none'}"
+                    )
+                    log(
+                        f"TVON: audio set failed rc={result.returncode} "
+                        f"default={default or 'none'} {last_err}"
+                    )
+                    continue
+            except (OSError, subprocess.TimeoutExpired) as error:
+                last_err = str(error)
+                log(f"TVON: set-default-sink ERROR {error}")
+                continue
+
+        subprocess.run(
+            [tool, "setSystemVolume", "unmute"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+            env=env,
+        )
+        vol = subprocess.run(
+            [tool, "setSystemVolume", "100"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+            env=env,
+        )
+        if vol.returncode != 0:
+            log("TVON: setSystemVolume 100 failed (non-fatal)")
+        _persist_audio_selection(sink, last_profile)
+        log(f"TVON: audio HDMI ok default={sink}")
+        return True
 
     if last_err:
         log(f"TVON: audio refresh gave up ({last_err})")
@@ -966,8 +1181,7 @@ def refresh_batocera_audio(
 ) -> bool:
     """
     Если HDMI не было при старте PipeWire — остаётся Dummy (auto_null).
-    soft_only: только set-profile/set (без S06audio restart) — безопаснее, когда
-    картинка уже есть; полный restart PipeWire на части плат зависает систему.
+    soft_only: set-profile/set (+ pactl nudge); hard — S06 PipeWire restart.
     """
     prefer_card = _audio_card_for_output(hdmi_output)
     log(
@@ -975,12 +1189,31 @@ def refresh_batocera_audio(
         f"card={prefer_card or 'any'} soft_only={soft_only}"
     )
     if soft_only:
-        return _apply_hdmi_audio(prefer_card, attempts=3, allow_audio_start=False)
+        # One soft round; stage_audio loops these until audio_soft_wait_sec.
+        return _apply_hdmi_audio(
+            prefer_card,
+            attempts=3,
+            allow_audio_start=False,
+            settle_sec=0.5,
+            retry_sec=1.2,
+        )
 
-    _run_init_script("S06audio", "restart", timeout=90)
-    time.sleep(3)
-    _run_init_script("S27audioconfig", "restart", timeout=90)
-    return _apply_hdmi_audio(prefer_card, attempts=5, allow_audio_start=True)
+    # S06/PipeWire restart often fires DRM HOTPLUG → Batocera checker quits ES.
+    # Do NOT restart S27 here while audio.device=auto (RPi5 no-op + long retries).
+    # Apply HDMI ourselves, then persist + S27 start so next boot uses HDMI.
+    with suppress_batocera_hotplug_quit(float(tvon.hotplug_suppress_sec)):
+        _run_init_script("S06audio", "restart", timeout=90)
+        time.sleep(3)
+        ok = _apply_hdmi_audio(
+            prefer_card,
+            attempts=8,
+            allow_audio_start=True,
+            settle_sec=1.5,
+            retry_sec=2.0,
+        )
+        if ok:
+            _run_init_script("S27audioconfig", "start", timeout=90)
+        return ok
 
 
 def restart_emulationstation() -> None:
@@ -1199,8 +1432,25 @@ def verify_picture(output: str | None) -> bool:
 def verify_audio_hdmi(hdmi_output: str | None) -> bool:
     prefer_card = _audio_card_for_output(hdmi_output)
     sink = _pick_hdmi_sink(prefer_card)
-    log(f"TVON: verify audio sink={sink or 'none'} card={prefer_card or 'any'}")
-    return sink is not None
+    default = _default_sink()
+    # Presence alone is not enough: cold boot often has Dummy as default
+    # while HDMI is missing, or HDMI listed but default still auto_null.
+    ok = bool(
+        sink
+        and default
+        and (
+            default == sink
+            or (
+                _is_hdmi_sink_id(default)
+                and (not prefer_card or prefer_card in default.lower())
+            )
+        )
+    )
+    log(
+        f"TVON: verify audio sink={sink or 'none'} "
+        f"default={default or 'none'} card={prefer_card or 'any'} ok={ok}"
+    )
+    return ok
 
 
 def stage_tv_power(tvon: TvonConfig) -> bool:
@@ -1321,44 +1571,66 @@ def stage_audio(tvon: TvonConfig, active_hdmi: str | None, physical_address: str
             tvon, physical_address
         )
 
-    if verify_audio_hdmi(active_hdmi):
-        ok = refresh_batocera_audio(tvon, active_hdmi, soft_only=True)
-        if ok and _picture_and_source_ok():
-            log("TVON: stage 4 ok (soft)")
-            return True
-        if ok and not verify_active_source(tvon, physical_address):
-            log("TVON: stage 4 active_source lost after soft audio — re-claim")
-            ensure_active_source(tvon, physical_address)
-
-    for attempt in range(1, tvon.audio_retries + 1):
-        log(f"TVON: stage 4 attempt {attempt}/{tvon.audio_retries}")
-        soft_ok = refresh_batocera_audio(tvon, active_hdmi, soft_only=True)
-        if soft_ok and verify_audio_hdmi(active_hdmi):
-            if not verify_picture(active_hdmi) and tvon.refresh_display:
-                log("TVON: stage 4 picture lost after soft audio — setOutput")
-                refresh_batocera_output(tvon, active_hdmi)
-            if not verify_active_source(tvon, physical_address):
-                ensure_active_source(tvon, physical_address)
-            if verify_audio_hdmi(active_hdmi) and _picture_and_source_ok():
-                log("TVON: stage 4 ok (soft)")
-                return True
-
-        if not tvon.audio_hard_restart:
-            log("TVON: stage 4 soft fail, hard restart disabled")
-            continue
-
-        log("TVON: stage 4 recover hard S06audio restart")
-        hard_ok = refresh_batocera_audio(tvon, active_hdmi, soft_only=False)
-        if not verify_picture(active_hdmi):
-            log("TVON: stage 4 picture lost after hard audio — setOutput")
-            if tvon.refresh_display:
-                refresh_batocera_output(tvon, active_hdmi)
+    def _after_audio_fix() -> None:
+        if not verify_picture(active_hdmi) and tvon.refresh_display:
+            log("TVON: stage 4 picture lost after audio — setOutput")
+            refresh_batocera_output(tvon, active_hdmi)
         if not verify_active_source(tvon, physical_address):
+            log("TVON: stage 4 active_source lost after audio — re-claim")
             ensure_active_source(tvon, physical_address)
+
+    def _soft_ok() -> bool:
+        if not refresh_batocera_audio(tvon, active_hdmi, soft_only=True):
+            return False
+        _after_audio_fix()
+        return verify_audio_hdmi(active_hdmi) and _picture_and_source_ok()
+
+    # Already have HDMI sink: soft set only — never hard-restart working audio.
+    if verify_audio_hdmi(active_hdmi) and _soft_ok():
+        log("TVON: stage 4 ok (soft)")
+        return True
+
+    # Patient soft wait: PipeWire often lists HDMI a bit later without S06.
+    wait_sec = tvon.audio_soft_wait_sec
+    log(f"TVON: stage 4 soft wait up to {wait_sec}s (hard only if still failing)")
+    deadline = time.monotonic() + wait_sec
+    soft_round = 0
+    while time.monotonic() < deadline:
+        soft_round += 1
+        if _soft_ok():
+            log(f"TVON: stage 4 ok (soft, round {soft_round})")
+            return True
+        remain = deadline - time.monotonic()
+        if remain <= 0:
+            break
+        pause = min(3.0, remain)
+        log(
+            f"TVON: stage 4 soft pending "
+            f"(round {soft_round}, {remain:.0f}s left)"
+        )
+        time.sleep(pause)
+
+    if verify_audio_hdmi(active_hdmi) and _soft_ok():
+        log("TVON: stage 4 ok (soft, after wait)")
+        return True
+
+    if not tvon.audio_hard_restart:
+        log("TVON: stage 4 soft fail after wait, hard restart disabled")
+        return verify_audio_hdmi(active_hdmi)
+
+    hard_attempts = max(1, min(tvon.audio_retries, 2))
+    for attempt in range(1, hard_attempts + 1):
+        log(
+            f"TVON: stage 4 hard {attempt}/{hard_attempts} "
+            "(soft wait exhausted)"
+        )
+        hard_ok = refresh_batocera_audio(tvon, active_hdmi, soft_only=False)
+        _after_audio_fix()
         if hard_ok and verify_audio_hdmi(active_hdmi) and _picture_and_source_ok():
             log("TVON: stage 4 ok (hard)")
             return True
-        time.sleep(tvon.display_retry_sec)
+        if attempt < hard_attempts:
+            time.sleep(tvon.display_retry_sec)
 
     ok = verify_audio_hdmi(active_hdmi)
     if ok:
@@ -1432,6 +1704,8 @@ def supervise(tvon: TvonConfig) -> int:
         f"keep={tvon.active_source_keep_sec}s "
         f"refresh_audio={tvon.refresh_audio} "
         f"audio_hard_restart={tvon.audio_hard_restart} "
+        f"audio_soft_wait={tvon.audio_soft_wait_sec}s "
+        f"hotplug_suppress={tvon.hotplug_suppress_sec}s "
         f"restart_es={tvon.restart_es} "
         f"restart_es_if_empty={tvon.restart_es_if_empty} "
         f"picture_retries={tvon.picture_retries} "

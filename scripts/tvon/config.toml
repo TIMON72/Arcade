@@ -32,9 +32,14 @@ active_source_recheck_sec = 3
 active_source_keep_sec = 120
 # После CEC — batocera-resolution setOutput (чинит чёрный экран после boot без ТВ)
 refresh_display = true
-# Звук: сначала soft set-profile/set; hard S06 только если нет HDMI sink
+# Звук: soft set-profile/set; hard S06 только если после soft-wait всё ещё fail
 refresh_audio = true
 audio_hard_restart = true
+# Сколько ждать soft (сек), прежде чем эскалировать на S06. 0 = сразу hard после 1 soft.
+audio_soft_wait_sec = 45
+# Перед setOutput / S06: пульсировать /tmp/no-hotplug (штатный escape Batocera),
+# чтобы DRM HOTPLUG не слал curl /quit в ES. 0 = выкл. Не трогает udev.
+hotplug_suppress_sec = 20
 # Безусловный ES restart — last resort на stage picture (опасно на Pi5+NVMe)
 restart_es = false
 # После успешных этапов: ES restart ТОЛЬКО если при старте settled display list был [ ]
@@ -45,7 +50,8 @@ es_restart_settle_sec = 8
 display_retries = 5
 display_retry_sec = 3
 picture_retries = 5
-audio_retries = 3
+# Soft wait then hard S06 — не больше audio_retries (cap 2)
+audio_retries = 2
 # Короткий post-check после stage 4 (картинка не отвалилась)
 post_check_attempts = 2
 post_check_sec = 8

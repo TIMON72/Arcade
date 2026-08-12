@@ -11,6 +11,7 @@ import socket
 import tempfile
 import platform
 import gzip
+import tarfile
 import tomllib
 import threading
 from dataclasses import dataclass
@@ -35,6 +36,7 @@ _ARCADE_CHECKOUT = os.path.join(_BATOCERA_SYSTEM_DIR, "Arcade")
 _ARCADE_SERVICES = ("main", "timer", "server", "tvon")
 _GIT_INSTALL_DIR = os.path.join(_BATOCERA_SYSTEM_DIR, "git")
 _GIT_VENDOR_REL = os.path.join("vendor", "git")
+_VENV_VENDOR_REL = os.path.join("vendor", "venv")
 _GIT_LINK_NAMES = (
     "git",
     "git-shell",
@@ -360,6 +362,7 @@ def _strip_scripts_exec_bits(scripts_dir: str) -> None:
 
 def _deploy_copy(src: str, dst: str, *, follow_symlinks: bool = True) -> None:
     shutil.copy2(src, dst, follow_symlinks=follow_symlinks)
+    _fsync_file(dst)
     if src.endswith(".py"):
         try:
             mode = os.stat(dst).st_mode
@@ -367,6 +370,126 @@ def _deploy_copy(src: str, dst: str, *, follow_symlinks: bool = True) -> None:
                 os.chmod(dst, mode & ~0o111)
         except OSError:
             pass
+
+
+def _fsync_file(path: str) -> None:
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def _fsync_dir(path: str) -> None:
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def _fsync_tree(root: str) -> None:
+    if not os.path.isdir(root):
+        if os.path.isfile(root):
+            _fsync_file(root)
+        return
+    for dirpath, _dirnames, filenames in os.walk(root):
+        for name in filenames:
+            _fsync_file(os.path.join(dirpath, name))
+        _fsync_dir(dirpath)
+
+
+def _sync_filesystem() -> None:
+    """Push dirty pages to disk so reboot does not revive empty stubs."""
+    try:
+        os.sync()
+    except (AttributeError, OSError):
+        pass
+
+
+def _remove_path(path: str) -> None:
+    if os.path.isdir(path) and not os.path.islink(path):
+        shutil.rmtree(path, ignore_errors=True)
+    elif os.path.lexists(path):
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+def _atomic_replace_dir(
+    src: str,
+    dst: str,
+    *,
+    ignore=None,
+    copy_function=shutil.copy2,
+    min_file: tuple[str, int] | None = None,
+) -> None:
+    """Copy src → dst.arcade-new, verify, then swap over dst (old kept until swap)."""
+    parent = os.path.dirname(os.path.abspath(dst))
+    os.makedirs(parent, mode=0o755, exist_ok=True)
+    tmp = dst + ".arcade-new"
+    bak = dst + ".arcade-old"
+    _remove_path(tmp)
+    _remove_path(bak)
+    shutil.copytree(
+        src,
+        tmp,
+        ignore=ignore,
+        copy_function=copy_function,
+        symlinks=True,
+    )
+    _fsync_tree(tmp)
+    if min_file is not None:
+        rel, min_size = min_file
+        check = os.path.join(tmp, rel)
+        size = os.path.getsize(check) if os.path.isfile(check) else -1
+        if size < min_size:
+            _remove_path(tmp)
+            raise RuntimeError(
+                f"deploy staging empty/tiny: {check} (size={size}, need>={min_size})"
+            )
+    if os.path.lexists(dst):
+        os.rename(dst, bak)
+    try:
+        os.rename(tmp, dst)
+    except OSError:
+        if os.path.lexists(bak) and not os.path.lexists(dst):
+            try:
+                os.rename(bak, dst)
+            except OSError:
+                pass
+        raise
+    _remove_path(bak)
+    _fsync_dir(parent)
+
+
+def _atomic_replace_file(src: str, dst: str) -> None:
+    """Copy file to dst via temp name, then os.replace (same filesystem)."""
+    parent = os.path.dirname(os.path.abspath(dst))
+    os.makedirs(parent, mode=0o755, exist_ok=True)
+    tmp = dst + ".arcade-new"
+    _remove_path(tmp)
+    shutil.copy2(src, tmp)
+    if os.path.basename(dst) in _ARCADE_SERVICES or src.endswith(".sh"):
+        _fix_shell_line_endings(tmp)
+        try:
+            os.chmod(tmp, 0o755)
+        except OSError:
+            pass
+    _fsync_file(tmp)
+    os.replace(tmp, dst)
+    _fsync_dir(parent)
 
 
 def _ensure_batocera_services_enabled() -> None:
@@ -456,14 +579,36 @@ def deploy_to_batocera(force: bool = False, source_root: str | None = None) -> b
     for folder in ("configs", "services", "scripts"):
         src = os.path.join(source_root, folder)
         dst = os.path.join(_BATOCERA_SYSTEM_DIR, folder)
+        if not os.path.isdir(src):
+            continue
         print(f"  {folder}/ -> {dst}")
-        shutil.copytree(
-            src,
-            dst,
-            dirs_exist_ok=True,
-            ignore=_deploy_ignore,
-            copy_function=_deploy_copy,
-        )
+        if folder == "scripts":
+            # Atomic per-package swap: never wipe live package before new tree verifies.
+            for name in _ARCADE_SERVICES:
+                src_pkg = os.path.join(src, name)
+                if not os.path.isdir(src_pkg):
+                    continue
+                _atomic_replace_dir(
+                    src_pkg,
+                    os.path.join(dst, name),
+                    ignore=_deploy_ignore,
+                    copy_function=_deploy_copy,
+                    min_file=(f"{name}.py", 1000),
+                )
+        elif folder == "services":
+            os.makedirs(dst, mode=0o755, exist_ok=True)
+            for name in _ARCADE_SERVICES:
+                src_file = os.path.join(src, name)
+                if os.path.isfile(src_file):
+                    _atomic_replace_file(src_file, os.path.join(dst, name))
+        else:
+            shutil.copytree(
+                src,
+                dst,
+                dirs_exist_ok=True,
+                ignore=_deploy_ignore,
+                copy_function=_deploy_copy,
+            )
 
     scripts_dest = os.path.join(_BATOCERA_SYSTEM_DIR, "scripts")
 
@@ -474,14 +619,16 @@ def deploy_to_batocera(force: bool = False, source_root: str | None = None) -> b
             wheels_src,
             wheels_dst,
             dirs_exist_ok=True,
-            copy_function=shutil.copy2,
+            copy_function=_deploy_copy,
         )
+        _fsync_tree(wheels_dst)
         print(f"  wheels/ -> {wheels_dst}")
 
     project_conf = os.path.join(source_root, "batocera.conf")
     dest_conf = os.path.join(_BATOCERA_SYSTEM_DIR, "batocera.conf")
     if os.path.isfile(project_conf):
         shutil.copy2(project_conf, dest_conf)
+        _fsync_file(dest_conf)
         print(f"  batocera.conf -> {dest_conf}")
 
     _chmod_services(os.path.join(_BATOCERA_SYSTEM_DIR, "services"))
@@ -493,12 +640,57 @@ def deploy_to_batocera(force: bool = False, source_root: str | None = None) -> b
     install_cursor_extensions(source_root)
 
     _write_deploy_marker(source_root, fingerprint)
+    _fsync_file(_DEPLOY_MARKER)
+    _sync_filesystem()
 
-    print("✓ Batocera deployment complete")
+    for name in _ARCADE_SERVICES:
+        path = os.path.join(scripts_dest, name, f"{name}.py")
+        size = os.path.getsize(path) if os.path.isfile(path) else -1
+        if size < 1000:
+            raise RuntimeError(
+                f"deploy left empty/tiny runtime script: {path} (size={size})"
+            )
+
+    print("✓ Batocera deployment complete (fsync'd)")
     print(f"  marker: {_DEPLOY_MARKER}")
     print(f"  Services: {' '.join(_ARCADE_SERVICES)}")
     print("=" * 60)
     return True
+
+
+def _runtime_script_size(name: str) -> int:
+    path = os.path.join(_DEPLOYED_SCRIPTS_DIR, name, f"{name}.py")
+    try:
+        return os.path.getsize(path) if os.path.isfile(path) else -1
+    except OSError:
+        return -1
+
+
+def heal_runtime_if_corrupt(min_size: int = 1000) -> bool:
+    """
+    If runtime scripts are 0-byte/tiny but Arcade checkout is healthy, force redeploy.
+    Covers reboot-after-deploy without fsync and fingerprint-skip leaving stubs.
+    """
+    if not _is_batocera_system():
+        return False
+    broken = [name for name in _ARCADE_SERVICES if _runtime_script_size(name) < min_size]
+    if not broken:
+        return False
+    source = _arcade_checkout_root()
+    if source is None:
+        print(f"⚠ runtime corrupt ({broken}) but no Arcade checkout to heal from")
+        return False
+    for name in broken:
+        arcade_py = os.path.join(source, "scripts", name, f"{name}.py")
+        try:
+            ok = os.path.isfile(arcade_py) and os.path.getsize(arcade_py) >= min_size
+        except OSError:
+            ok = False
+        if not ok:
+            print(f"⚠ runtime corrupt ({name}) and Arcade copy also bad — skip heal")
+            return False
+    print(f"Healing corrupt runtime from Arcade: {', '.join(broken)}")
+    return deploy_to_batocera(force=True, source_root=source)
 
 
 def sync_arcade_checkout() -> bool:
@@ -978,8 +1170,149 @@ def vendor_wheels() -> int:
     return subprocess.call(cmd)
 
 
+def _venv_archive_arch() -> str:
+    arch = _host_arch()
+    if arch in ("aarch64", "arm64"):
+        return "aarch64"
+    if arch in ("x86_64", "amd64"):
+        return "x86_64"
+    return arch
+
+
+def _venv_vendor_archive_name() -> str:
+    return f"{_venv_archive_arch()}.tar.gz"
+
+
+def _venv_vendor_roots() -> list[str]:
+    roots: list[str] = []
+    seen: set[str] = set()
+    for root in (
+        _arcade_checkout_root(),
+        _deploy_source_root(),
+        _bundle_root(),
+    ):
+        if not root:
+            continue
+        real = os.path.realpath(root)
+        if real in seen:
+            continue
+        seen.add(real)
+        roots.append(real)
+    return roots
+
+
+def _find_venv_vendor_archive() -> str | None:
+    name = _venv_vendor_archive_name()
+    for root in _venv_vendor_roots():
+        path = os.path.join(root, _VENV_VENDOR_REL, name)
+        if os.path.isfile(path) and os.path.getsize(path) > 1024:
+            return path
+    return None
+
+
+def _remove_venv_dir(path: str) -> None:
+    if not os.path.isdir(path):
+        return
+    try:
+        shutil.rmtree(path)
+    except OSError as error:
+        print(f"✗ ERROR: Cannot remove {path}: {error}")
+        sys.exit(1)
+
+
+def _install_venv_from_archive(archive: str, scripts_dir: str) -> bool:
+    """Распаковать vendor/venv/<arch>.tar.gz → scripts/.venv (без venv.create/pip)."""
+    global _VENV_DIR
+    print("=" * 60)
+    print(f"Prebuilt venv: extracting {archive}")
+    print("=" * 60)
+    preferred = os.path.join(scripts_dir, ".venv")
+    staging = os.path.join(scripts_dir, ".venv.new")
+    extract_root = os.path.join(scripts_dir, ".venv.extract")
+    _remove_venv_dir(staging)
+    _remove_venv_dir(extract_root)
+    os.makedirs(extract_root, mode=0o755, exist_ok=True)
+    try:
+        with tarfile.open(archive, "r:gz") as tar:
+            tar.extractall(path=extract_root)
+        if os.path.isdir(os.path.join(extract_root, ".venv")):
+            source = os.path.join(extract_root, ".venv")
+        elif os.path.isdir(os.path.join(extract_root, "bin")):
+            source = extract_root
+        else:
+            print("✗ ERROR: archive has no .venv/ (or bin/) root")
+            return False
+        if source != staging:
+            if os.path.isdir(staging):
+                _remove_venv_dir(staging)
+            os.rename(source, staging)
+        _remove_venv_dir(preferred)
+        os.rename(staging, preferred)
+        _VENV_DIR = preferred
+        _sync_filesystem()
+        if not _venv_is_usable():
+            print(f"✗ ERROR: extracted venv unusable at {preferred}")
+            return False
+        print(f"✓ Prebuilt venv ready: {preferred}")
+        return True
+    except (OSError, tarfile.TarError) as error:
+        print(f"✗ ERROR: venv extract failed: {error}")
+        return False
+    finally:
+        _remove_venv_dir(extract_root)
+        if os.path.isdir(staging):
+            _remove_venv_dir(staging)
+
+
+def vendor_venv() -> int:
+    """Упаковать текущий scripts/.venv → vendor/venv/<arch>.tar.gz (для offline -Copy)."""
+    global _VENV_DIR
+    scripts_dir = _runtime_scripts_dir()
+    _VENV_DIR = _resolve_venv_dir()
+    if not _venv_is_usable():
+        print("✗ ERROR: no usable .venv — run main once (setup_venv) first")
+        return 1
+    if not _deps_installed(_venv_python()):
+        print("✗ ERROR: .venv missing luma — finish setup_venv before vendor-venv")
+        return 1
+
+    dest_root = _arcade_checkout_root() or _bundle_root()
+    if not dest_root or not os.path.isdir(dest_root):
+        print("✗ ERROR: cannot resolve Arcade root for vendor/venv/")
+        return 1
+
+    vendor_dir = os.path.join(dest_root, _VENV_VENDOR_REL)
+    os.makedirs(vendor_dir, mode=0o755, exist_ok=True)
+    archive = os.path.join(vendor_dir, _venv_vendor_archive_name())
+    tmp = archive + ".tmp"
+    if os.path.isfile(tmp):
+        os.remove(tmp)
+
+    print(f"Packing {_VENV_DIR} -> {archive}")
+    try:
+        with tarfile.open(tmp, "w:gz") as tar:
+            tar.add(_VENV_DIR, arcname=".venv")
+        os.replace(tmp, archive)
+        _fsync_file(archive)
+        _sync_filesystem()
+    except (OSError, tarfile.TarError) as error:
+        if os.path.isfile(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        print(f"✗ ERROR: vendor-venv failed: {error}")
+        return 1
+
+    size_mb = os.path.getsize(archive) / (1024 * 1024)
+    print(f"✓ vendor venv archive ready ({size_mb:.1f} MB)")
+    print("  On PC: .\\deploy\\deploy.ps1 <machine> -PullVenv")
+    print("  Then:  .\\deploy\\deploy.ps1 -Copy ...  (seeds scripts/.venv)")
+    return 0
+
+
 def setup_venv():
-    """Создаёт .venv и ставит luma (офлайн из wheels/, если есть)."""
+    """Ставит .venv: prebuilt archive → иначе create + wheels/pip."""
     global _VENV_DIR
     scripts_dir = _runtime_scripts_dir()
     preferred = os.path.join(scripts_dir, ".venv")
@@ -993,16 +1326,28 @@ def setup_venv():
     # Обломок .venv (например только lib64) блокировал create — пересоздаём
     if os.path.isdir(_VENV_DIR) and not _venv_is_usable():
         print(f"⚠ Broken virtualenv at {_VENV_DIR} — recreating...")
-        try:
-            shutil.rmtree(_VENV_DIR)
-        except OSError as error:
-            print(f"✗ ERROR: Cannot remove broken venv: {error}")
-            sys.exit(1)
+        _remove_venv_dir(_VENV_DIR)
 
     venv_python = _venv_python()
     if os.path.isdir(_VENV_DIR) and _deps_installed(venv_python):
         _link_workspace_venv()
         return _VENV_DIR
+
+    # Офлайн first-boot: распаковать заготовку вместо тяжёлого venv.create+pip
+    if not os.path.isdir(_VENV_DIR) or not _venv_is_usable():
+        archive = _find_venv_vendor_archive()
+        if archive:
+            if _install_venv_from_archive(archive, scripts_dir):
+                _VENV_DIR = _resolve_venv_dir()
+                if _deps_installed(_venv_python()):
+                    _link_workspace_venv()
+                    print("=" * 60)
+                    return _VENV_DIR
+                print("⚠ Prebuilt venv missing luma — falling back to pip/wheels")
+            else:
+                print("⚠ Prebuilt venv extract failed — falling back to create")
+                _remove_venv_dir(preferred)
+                _VENV_DIR = _resolve_venv_dir()
 
     if not os.path.isdir(_VENV_DIR):
         print("=" * 60)
@@ -1077,6 +1422,8 @@ if __name__ == "__main__":
         raise SystemExit(vendor_git())
     if len(sys.argv) > 1 and sys.argv[1] == "vendor-extensions":
         raise SystemExit(vendor_extensions())
+    if len(sys.argv) > 1 and sys.argv[1] == "vendor-venv":
+        raise SystemExit(vendor_venv())
     if len(sys.argv) > 1 and sys.argv[1] == "install-git":
         raise SystemExit(0 if install_portable_git() else 1)
     if len(sys.argv) > 1 and sys.argv[1] == "install-extensions":
@@ -1087,7 +1434,9 @@ if __name__ == "__main__":
             _refresh_paths()
             setup_venv()
         raise SystemExit(0 if ok else 1)
-    if deploy_to_batocera():
+    if heal_runtime_if_corrupt():
+        _refresh_paths()
+    elif deploy_to_batocera():
         _refresh_paths()
     _refresh_paths()
     print("Initializing virtual environment...")
@@ -1230,7 +1579,11 @@ def main():
 
     log("MAIN service STARTED (deploy/venv/ssh hub)")
     try:
-        if sync_arcade_checkout():
+        if heal_runtime_if_corrupt():
+            log("MAIN: healed corrupt/empty runtime from Arcade")
+            _refresh_paths()
+            setup_venv()
+        elif sync_arcade_checkout():
             log("MAIN: Arcade checkout synced to /userdata/system/")
             _refresh_paths()
             setup_venv()

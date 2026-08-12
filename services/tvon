@@ -5,17 +5,32 @@ ROOT="/userdata/system/scripts"
 SCRIPT="$ROOT/tvon/tvon.py"
 PIDFILE="/var/run/tvon-service.pid"
 LOG="/userdata/system/logs/tvon-service.log"
-PYTHON="$ROOT/.venv/bin/python"
-[ -x "$PYTHON" ] || PYTHON="$ROOT/venv/bin/python"
-[ -x "$PYTHON" ] || PYTHON="python3"
+pick_python() {
+    local cand sz
+    for cand in "$ROOT/.venv/bin/python" "$ROOT/venv/bin/python"; do
+        if [ -x "$cand" ]; then
+            sz=$(wc -c < "$cand" 2>/dev/null || echo 0)
+            [ "$sz" -ge 64 ] && { echo "$cand"; return 0; }
+        fi
+    done
+    echo "python3"
+}
+PYTHON="$(pick_python)"
 
 start() {
     if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
         echo "tvon is already running (PID $(cat "$PIDFILE"))"
         return 0
     fi
-    if [ ! -f "$SCRIPT" ]; then
-        echo "tvon: script not found: $SCRIPT"
+    # Wait for main heal if runtime was 0-byte after reboot
+    local sz=0 i
+    for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+        sz=$(wc -c < "$SCRIPT" 2>/dev/null || echo 0)
+        [ "$sz" -ge 1000 ] && break
+        sleep 1
+    done
+    if [ "$sz" -lt 1000 ]; then
+        echo "tvon: script empty/missing: $SCRIPT (size=$sz)"
         return 1
     fi
     mkdir -p "$(dirname "$LOG")"
