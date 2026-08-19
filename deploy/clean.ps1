@@ -1,8 +1,8 @@
-# Wipe Arcade sync + runtime stubs on a Batocera cabinet (before a clean deploy).
+# Wipe Arcade checkout (and optionally runtime) on a Batocera cabinet before a clean deploy.
 # Usage:
-#   .\deploy\clean.ps1 zero
-#   .\deploy\clean.ps1 zero -Runtime   # also remove /userdata/system/scripts/{main,timer,server,tvon}
-#   .\deploy\clean.ps1 zero -Venv      # + remove .venv (next Full deploy recreates it)
+#   .\deploy\clean.ps1 zero                 # checkout scripts/services/configs only
+#   .\deploy\clean.ps1 zero -Runtime        # + /userdata/system/scripts/{main,timer,server,tvon}
+#   .\deploy\clean.ps1 zero -Runtime -Venv  # + .venv; next: .\deploy\deploy.ps1 zero -Full -Restart
 
 [CmdletBinding()]
 param(

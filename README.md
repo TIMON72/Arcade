@@ -59,15 +59,7 @@ Batocera уже загружена, пинг/SSH ок.
 - дописывает в `/boot/cmdline.txt` защиту Pi5+NVMe (см. ниже)
 - `batocera-services restart main timer server tvon`
 
-Повседневные обновления (код изменился — освежить автомат):
-
-```powershell
-.\deploy\deploy.ps1 zero -Update
-# то же + wheels/vendor:
-.\deploy\deploy.ps1 zero -Update -Full
-```
-
-`-Update` = sync новых/изменённых файлов → on-device deploy → restart `main timer server tvon`.
+Дальше, когда правите код с ПК, — раздел **Обычная работа с ПК**.
 
 Чистый переустанов без смены железа:
 
@@ -191,51 +183,101 @@ nvme_core.default_ps_max_latency_us=0 pcie_aspm=off pcie_port_pm=off
 
 ---
 
-## День за днём с ПК
+## Обычная работа с ПК
+
+`zero` в примерах — имя из `deploy/machines.json` (можно IP).  
+Без `-Full` **не** копируются `wheels/` и `vendor/` — для правок Python так и нужно.
+
+`-Update` и `-Restart` сейчас одно и то же: файлы на автомат → `main.py deploy` в runtime → restart `main timer server tvon`.
+
+В конце `deploy.ps1` сам открывает follow логов. Чтобы сразу выйти — добавьте `-NoLogs` к любой команде заливки.
+
+### Поправил код — залить и перезапустить сервисы
+
+Основной ежедневный путь. Сервисы подхватывают новый код.
 
 ```powershell
-.\deploy\deploy.ps1 zero -Update            # освежить код + restart сервисов
-.\deploy\deploy.ps1 zero -Update -Full      # + wheels/vendor
-.\deploy\deploy.ps1 zero -Test              # health: boot 3м + soak 5м ×3 (с reboot)
-.\deploy\deploy.ps1 zero -Update -Test      # sync/deploy/restart, затем -Test
-.\deploy\deploy.ps1 zero                    # sync + deploy + логи (без restart)
-.\deploy\deploy.ps1 zero -Restart           # sync + deploy + restart
-.\deploy\deploy.ps1 zero -Full -Restart     # + wheels/vendor
-.\deploy\deploy.ps1 zero -NoDeploy          # только файлы в Arcade/
-.\deploy\deploy.ps1 zero -NoLogs            # без follow логов
+.\deploy\deploy.ps1 zero -Update
+```
 
-.\deploy\clean.ps1 zero -Runtime            # снос runtime scripts
-.\deploy\clean.ps1 zero -Runtime -Venv      # + снос .venv (далее нужен -Full / -Update -Full)
+### Поменялись wheels, vendor или снесён .venv
 
+Тяжёлая заливка (много записи на NVMe). После `clean.ps1 … -Venv` нужна именно она.
+
+```powershell
+.\deploy\deploy.ps1 zero -Update -Full
+```
+
+### Нужно прогнать health (ребут ×3)
+
+Отдельный скрипт, не флаг `deploy.ps1`. Если автомат в сети — ребут. Дальше: SSH ≤1 мин, бут ≤5 мин (когда timer+server живы — `ADD_5`), 5 мин «alive». Три цикла.
+
+```powershell
+.\deploy\test.ps1 zero
+```
+
+Сначала залить правки, потом проверить:
+
+```powershell
+.\deploy\deploy.ps1 zero -Update -NoLogs
+.\deploy\test.ps1 zero
+```
+
+### Залить файлы, но не рестартить сервисы
+
+Checkout + runtime на диске обновятся, **процессы продолжат старый код в памяти**. Нужно перед Remote-SSH / F5, когда сервисы уже остановлены.
+
+```powershell
+.\deploy\deploy.ps1 zero
+```
+
+После отладки: `-Update` / `-Restart`.
+
+### Только папка `/userdata/system/Arcade`, runtime не трогать
+
+Файлы репозитория на автомате, `/userdata/system/scripts` не переписывается. Не сочетается с `-Update`.
+
+```powershell
+.\deploy\deploy.ps1 zero -NoDeploy
+```
+
+### Снести runtime перед чистой установкой
+
+Останавливает сервисы. `-Runtime` — рабочие `scripts/{main,timer,server,tvon}` и service-файлы. `-Venv` — ещё и `.venv` (потом обязателен `-Update -Full` или `-Full -Restart`).
+
+```powershell
+.\deploy\clean.ps1 zero -Runtime
+.\deploy\clean.ps1 zero -Runtime -Venv
+.\deploy\deploy.ps1 zero -Full -Restart -NoLogs
+```
+
+### Смотреть логи
+
+По умолчанию — общий `scripts/logs.log` (последние 5 мин, затем follow, Ctrl+C стоп).  
+`-Only` — один service-лог. `-AllServices` — `logs.log` + все `*-service.log`.
+
+```powershell
 .\deploy\logs.ps1 zero
 .\deploy\logs.ps1 zero -Only tvon
 .\deploy\logs.ps1 zero -AllServices
+.\deploy\logs.ps1 zero -SinceMinutes 10
 ```
-
-Cursor Tasks: **Sync to machine** / **Sync to machine + restart services** / **Remote logs**.
-
-Без `-Full` wheels/vendor не едут — для обычных правок кода так и нужно.
 
 SSH host keys после смены диска меняются: скрипты сами делают `ssh-keygen -R` и `StrictHostKeyChecking=no`.
 
 ---
 
-## Логи и отладка
-
-```powershell
-.\deploy\logs.ps1 zero                 # scripts/logs.log, последние 5 мин + follow
-.\deploy\logs.ps1 zero -SinceMinutes 10
-```
+## Отладка с ПК
 
 На автомате: `/userdata/system/logs/<сервис>-service.log`, `/userdata/system/scripts/logs.log`.
 
 Remote-SSH + debugpy:
 
-1. `.\deploy\deploy.ps1 zero`
+1. `.\deploy\deploy.ps1 zero -NoLogs`
 2. Cursor → `root@<IP>` → open `/userdata/system/Arcade`
 3. F5 → compound **Arcade**
 
-После отладки: `.\deploy\deploy.ps1 zero -Restart`.
+После отладки: `.\deploy\deploy.ps1 zero -Update -NoLogs`.
 
 Обновление без ПК (если на автомате есть git):
 

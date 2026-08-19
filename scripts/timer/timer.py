@@ -47,7 +47,8 @@ class TerminalConfig:
     enabled: bool = True
     pin: int = 26
     active_high: bool = False
-    debounce_ms: int = 0
+    debounce_ms: int = 50
+    max_pulse_ms: int = 2500
     start_delay_ms: int = 2000
 
 
@@ -213,6 +214,7 @@ def load_terminal_config(data: dict | None = None) -> TerminalConfig:
         pin=_read_bcm_pin(section, "pin", defaults.pin),
         active_high=_read_bool(section, "active_high", defaults.active_high),
         debounce_ms=_read_non_negative_int(section, "debounce_ms", defaults.debounce_ms),
+        max_pulse_ms=_read_positive_int(section, "max_pulse_ms", defaults.max_pulse_ms),
         start_delay_ms=_read_positive_int(section, "start_delay_ms", defaults.start_delay_ms),
     )
 
@@ -280,19 +282,29 @@ class TerminalCashless:
     Короткие импульсы: lgpio alert/callback + опрос в process().
     """
 
-    def __init__(self, pin, active_high=False, debounce_ms=0, start_delay_ms=2000):
+    def __init__(
+        self,
+        pin,
+        active_high=False,
+        debounce_ms=50,
+        max_pulse_ms=2500,
+        start_delay_ms=2000,
+    ):
         self.pin = pin
         self.active_high = active_high
-        self.debounce_s = max(0, debounce_ms) / 1000.0
+        # Окно ширины LOW: debounce_ms … max_pulse_ms (оба из [terminal]).
+        self.min_pulse_s = max(0, debounce_ms) / 1000.0
+        self.max_pulse_s = max(debounce_ms, max_pulse_ms) / 1000.0
         self.start_delay_s = max(1, start_delay_ms) / 1000.0
         self.active_level = 1 if active_high else 0
         self._h = None
         self._cb = None
         self._edge_q: queue.Queue = queue.Queue()
         self._initialized = False
-        self._stable_state = 0 if active_high else 1
-        self._last_raw_state = self._stable_state
-        self._raw_changed_at = 0.0
+        idle = 0 if active_high else 1
+        self._stable_state = idle
+        self._pulse_low = False
+        self._pulse_low_at = 0.0
         self._contact_closed_at = 0.0
         self._last_contact_opened_at = 0.0
         self._pulse_count = 0
@@ -319,14 +331,15 @@ class TerminalCashless:
         now = time.monotonic()
         self._h = chip_handle
         self._stable_state = level
-        self._last_raw_state = level
-        self._raw_changed_at = now
+        self._pulse_low = level == self.active_level
+        self._pulse_low_at = now
         self._initialized = True
         self._cb = lgpio.callback(chip_handle, self.pin, lgpio.BOTH_EDGES, self._on_edge)
         print(
             f"TERM_OUT_CASHLESS READY pin={self.pin} "
             f"active_high={self.active_high} level={level} "
-            f"debounce={int(self.debounce_s * 1000)}ms "
+            f"min_pulse={int(self.min_pulse_s * 1000)}ms "
+            f"max_pulse={int(self.max_pulse_s * 1000)}ms "
             f"start_delay={int(self.start_delay_s * 1000)}ms"
         )
 
@@ -350,12 +363,12 @@ class TerminalCashless:
             except queue.Empty:
                 break
 
-    def _on_pulse_closed(self):
-        """Один стабильный импульс (замыкание контакта) — как в Arduino."""
+    def _on_pulse_closed(self, width_ms: float) -> None:
+        """Один импульс в допустимом окне ширины — как в Arduino."""
         global hours, minutes, seconds, activated
 
         finish_timer_line()
-        log("TERM_OUT_CASHLESS: pulse")
+        log(f"TERM_OUT_CASHLESS: pulse width={width_ms:.1f}ms")
 
         if is_arduino_mode():
             # В WAITING Increase до Play глотается — шлём пакетом в batch
@@ -412,43 +425,50 @@ class TerminalCashless:
             do_playpause("terminal")
             tick_timer.refresh()
 
+    def _accept_width(self, width_s: float) -> None:
+        width_ms = width_s * 1000.0
+        if width_s < self.min_pulse_s or width_s > self.max_pulse_s:
+            log(f"TERM_OUT_CASHLESS: skip width={width_ms:.1f}ms")
+            return
+        self._on_pulse_closed(width_ms)
+
+    def _on_level(self, level: int, at: float) -> None:
+        closed = level == self.active_level
+        if closed:
+            if not self._pulse_low:
+                self._pulse_low = True
+                self._pulse_low_at = at
+                self._contact_closed_at = at
+            return
+        if not self._pulse_low:
+            return
+        self._last_contact_opened_at = at
+        self._stable_state = level
+        width_s = at - self._pulse_low_at
+        self._pulse_low = False
+        self._accept_width(width_s)
+
     def process(self):
         if not self._initialized or self._h is None:
             return
 
-        now = time.monotonic()
         while True:
             try:
-                raw_state, _edge_at = self._edge_q.get_nowait()
+                raw_state, edge_at = self._edge_q.get_nowait()
             except queue.Empty:
                 break
-            if raw_state != self._last_raw_state:
-                self._last_raw_state = raw_state
-                self._raw_changed_at = now
+            self._on_level(raw_state, edge_at)
 
-        # Актуальный уровень (на случай пропуска края в очереди)
+        now = time.monotonic()
         try:
             live = int(lgpio.gpio_read(self._h, self.pin))
-            if live != self._last_raw_state:
-                self._last_raw_state = live
-                self._raw_changed_at = now
         except Exception:
-            pass
-
-        if (
-            self._last_raw_state != self._stable_state
-            and (now - self._raw_changed_at) >= self.debounce_s
-        ):
-            self._stable_state = self._last_raw_state
-            if self._stable_state == self.active_level:
-                self._contact_closed_at = now
-                self._on_pulse_closed()
-            else:
-                self._last_contact_opened_at = now
+            live = self.active_level if self._pulse_low else (1 - self.active_level)
+        self._on_level(live, now)
 
         if (
             self._start_pending
-            and self._stable_state != self.active_level
+            and not self._pulse_low
             and (now - self._last_contact_opened_at) >= self.start_delay_s
         ):
             self._start_pending = False
@@ -1205,6 +1225,7 @@ def setup():
         f"enabled={_terminal_cfg.enabled}, pin={_terminal_cfg.pin}, "
         f"active_high={_terminal_cfg.active_high}, "
         f"debounce_ms={_terminal_cfg.debounce_ms}, "
+        f"max_pulse_ms={_terminal_cfg.max_pulse_ms}, "
         f"start_delay_ms={_terminal_cfg.start_delay_ms}"
     )
     if is_raspberry_mode():
@@ -1269,6 +1290,7 @@ def setup():
                     pin=_terminal_cfg.pin,
                     active_high=_terminal_cfg.active_high,
                     debounce_ms=_terminal_cfg.debounce_ms,
+                    max_pulse_ms=_terminal_cfg.max_pulse_ms,
                     start_delay_ms=_terminal_cfg.start_delay_ms,
                 )
                 terminal_cashless.setup(h)

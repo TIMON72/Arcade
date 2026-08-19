@@ -1,6 +1,9 @@
-# Tail Arcade shared logs.log on a Batocera cabinet.
-# Usage: .\deploy\logs.ps1 zero
-#        .\deploy\logs.ps1 zero -SinceMinutes 10
+# Tail Arcade logs on a Batocera cabinet (last N minutes, then follow).
+# Usage:
+#   .\deploy\logs.ps1 zero                 # scripts/logs.log
+#   .\deploy\logs.ps1 zero -Only tvon      # one *-service.log
+#   .\deploy\logs.ps1 zero -AllServices    # logs.log + all service logs
+#   .\deploy\logs.ps1 zero -SinceMinutes 10
 
 [CmdletBinding()]
 param(

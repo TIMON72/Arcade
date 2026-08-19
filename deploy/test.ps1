@@ -1,8 +1,8 @@
-﻿# Cabinet health test: reboot if online, SSH <=1m, boot <=5m, alive 5m, x3.
+﻿# Cabinet health test: if online → reboot; SSH ≤1m; boot ≤5m (ADD_5 when timer+server up);
+# alive 5m; three cycles.
 # Usage:
 #   .\deploy\test.ps1 zero
-#   .\deploy\test.ps1 zero -SshUser root -Auth linux
-# After deploy/update: .\deploy\deploy.ps1 zero -Update ; .\deploy\test.ps1 zero
+# After a code push: .\deploy\deploy.ps1 zero -Update -NoLogs ; .\deploy\test.ps1 zero
 
 [CmdletBinding()]
 param(

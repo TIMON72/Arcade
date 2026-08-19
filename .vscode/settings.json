@@ -12,5 +12,15 @@
     "python.analysis.typeCheckingMode": "basic",
     "basedpyright.analysis.typeCheckingMode": "basic",
     "files.eol": "\n",
-    "files.insertFinalNewline": true
+    "files.insertFinalNewline": true,
+    "cursorpyright.analysis.extraPaths": [
+        "${workspaceFolder}/scripts",
+        "${workspaceFolder}/scripts/main",
+        "${workspaceFolder}/scripts/timer",
+        "${workspaceFolder}/scripts/server",
+        "${workspaceFolder}/scripts/tvon",
+        "/usr/lib/python3.12/site-packages",
+        "/userdata/system/scripts/.venv/lib/python3.12/site-packages"
+    ],
+    "cursorpyright.analysis.typeCheckingMode": "basic"
 }

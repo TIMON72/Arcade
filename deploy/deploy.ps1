@@ -2,13 +2,16 @@
 # Safe path: userdata I/O probe → stop services → /tmp staging → Arcade.new verify →
 # swap → main.py deploy (atomic package replace) → runtime size check → optional restart.
 # Never wipes live runtime before verified staging/checkout.
-# Usage:
-#   .\deploy\deploy.ps1 zero -Update          # освежить: sync + deploy + restart сервисов
-#   .\deploy\deploy.ps1 zero -Update -Full    # то же + wheels/vendor
-#   .\deploy\test.ps1 zero                    # health: boot 5m + alive 5m, x3 with reboot
-#   .\deploy\deploy.ps1 zero
-#   .\deploy\deploy.ps1 zero -Full -Restart
-#   .\deploy\deploy.ps1 zero -NoLogs
+#
+# Situations (see README «Обычная работа с ПК»):
+#   .\deploy\deploy.ps1 zero -Update            # daily: files + runtime + restart
+#   .\deploy\deploy.ps1 zero -Update -Full      # + wheels/vendor (after venv wipe / dep change)
+#   .\deploy\deploy.ps1 zero                    # files + runtime, do not restart (Remote-SSH / F5)
+#   .\deploy\deploy.ps1 zero -Restart           # same as -Update
+#   .\deploy\deploy.ps1 zero -Full -Restart     # first install / reinstall with wheels
+#   .\deploy\deploy.ps1 zero -NoDeploy          # checkout Arcade/ only, leave runtime
+#   .\deploy\deploy.ps1 zero -Update -NoLogs    # any of the above without log follow
+#   .\deploy\test.ps1 zero                      # health: reboot ×3, boot 5m + alive 5m
 #   .\deploy\deploy.ps1 -Copy C:\Temp\Batocera\system
 #       → system\Arcade\ (+ wheels/vendor)
 #       → system\scripts\{main,timer,server,tvon,wheels}
