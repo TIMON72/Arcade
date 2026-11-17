@@ -34,6 +34,12 @@ INPUT_EVENT = struct.Struct("qqHHi")
 UINPUT_SETUP = struct.Struct("HHHH80sI")
 NAVIGATION_KEYS = (KEY_UP, KEY_DOWN, KEY_LEFT, KEY_RIGHT)
 VOLUME_KEYS = (BTN_BASE5, BTN_BASE6)
+DPAD_BUTTONS = {0x220: KEY_UP, 0x221: KEY_DOWN, 0x222: KEY_LEFT, 0x223: KEY_RIGHT}
+
+
+def navigation_button(code: int, value: int) -> tuple[int, bool] | None:
+    key = DPAD_BUTTONS.get(code)
+    return (key, bool(value)) if key is not None else None
 
 
 def navigation_key(axis: int, value: int) -> tuple[int, bool] | None:
@@ -201,8 +207,17 @@ class InputLocker:
                 for arrow in keys:
                     self.pressed_keys.discard(arrow)
                     self._emit(EV_KEY, arrow, 0)
-        elif event_type == EV_KEY and code in VOLUME_KEYS:
-            self._emit(EV_KEY, code, value)
+        elif event_type == EV_KEY:
+            mapped = navigation_button(code, value)
+            if mapped is not None:
+                key, pressed = mapped
+                if pressed:
+                    self.pressed_keys.add(key)
+                else:
+                    self.pressed_keys.discard(key)
+                self._emit(EV_KEY, key, int(pressed))
+            elif code in VOLUME_KEYS:
+                self._emit(EV_KEY, code, value)
 
     def _forward_events(self) -> None:
         for path, fd in list(self.fds.items()):
