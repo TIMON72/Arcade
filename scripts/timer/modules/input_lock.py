@@ -21,6 +21,8 @@ EV_ABS = 0x03
 SYN_REPORT = 0
 ABS_X = 0x00
 ABS_Y = 0x01
+ABS_HAT0X = 0x10
+ABS_HAT0Y = 0x11
 KEY_UP = 103
 KEY_DOWN = 108
 KEY_LEFT = 105
@@ -35,19 +37,24 @@ VOLUME_KEYS = (BTN_BASE5, BTN_BASE6)
 
 
 def navigation_key(axis: int, value: int) -> tuple[int, bool] | None:
-    if axis == ABS_X:
-        key = KEY_LEFT
-        opposite = KEY_RIGHT
-    elif axis == ABS_Y:
-        key = KEY_UP
-        opposite = KEY_DOWN
+    is_horizontal = axis in (ABS_X, ABS_HAT0X)
+    if is_horizontal:
+        key, opposite = KEY_LEFT, KEY_RIGHT
+    elif axis in (ABS_Y, ABS_HAT0Y):
+        key, opposite = KEY_UP, KEY_DOWN
     else:
         return None
+    if axis in (ABS_HAT0X, ABS_HAT0Y):
+        if value < 0:
+            return key, True
+        if value > 0:
+            return opposite, True
+        return key, False
     if value <= 63:
         return key, True
     if value >= 192:
         return opposite, True
-    return (KEY_LEFT if axis == ABS_X else KEY_UP), False
+    return key, False
 
 
 def discover_input_devices(proc_path: str = "/proc/bus/input/devices") -> list[tuple[str, str]]:
@@ -190,7 +197,7 @@ class InputLocker:
                 self.pressed_keys.add(key)
                 self._emit(EV_KEY, key, 1)
             else:
-                keys = (KEY_LEFT, KEY_RIGHT) if code == ABS_X else (KEY_UP, KEY_DOWN)
+                keys = (KEY_LEFT, KEY_RIGHT) if code in (ABS_X, ABS_HAT0X) else (KEY_UP, KEY_DOWN)
                 for arrow in keys:
                     self.pressed_keys.discard(arrow)
                     self._emit(EV_KEY, arrow, 0)
