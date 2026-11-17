@@ -58,7 +58,7 @@ class MatrixConfig:
     enabled: bool = True
     brightness: int = 7
     scroll_speed: int = 7
-    text_display: str = "АРЕНДА: т. +79233549295"
+    text_display: str = "АРЕНДА: т. +79029672222"
     din: int = 10
     clk: int = 11
     cs: int = 8

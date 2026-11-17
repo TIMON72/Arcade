@@ -48,7 +48,7 @@ start_delay_ms = 2000
 enabled = true
 brightness = 7
 scroll_speed = 7
-text_display = "АРЕНДА: т. +79233549295"
+text_display = "АРЕНДА: т. +79029672222"
 
 # Bitbang SPI по пинам din/clk/cs (BCM / физ. пин на Pi)
 din = 10             # MOSI / физ. 19
