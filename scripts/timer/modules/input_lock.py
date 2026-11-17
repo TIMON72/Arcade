@@ -12,6 +12,8 @@ from pathlib import Path
 EVIOCGRAB = 0x40044590
 UI_SET_EVBIT = 0x40045564
 UI_SET_KEYBIT = 0x40045565
+UI_SET_ABSBIT = 0x40045567
+UI_ABS_SETUP = 0x401C5504
 UI_DEV_SETUP = 0x405C5503
 UI_DEV_CREATE = 0x5501
 UI_DEV_DESTROY = 0x5502
@@ -29,9 +31,11 @@ KEY_LEFT = 105
 KEY_RIGHT = 106
 BTN_BASE5 = 0x12A
 BTN_BASE6 = 0x12B
+BTN_SOUTH = 0x130
 BUS_USB = 0x03
 INPUT_EVENT = struct.Struct("qqHHi")
 UINPUT_SETUP = struct.Struct("HHHH80sI")
+UINPUT_ABS_SETUP = struct.Struct("HHiiiiii")
 NAVIGATION_KEYS = (KEY_UP, KEY_DOWN, KEY_LEFT, KEY_RIGHT)
 VOLUME_KEYS = (BTN_BASE5, BTN_BASE6)
 DPAD_BUTTONS = {0x220: KEY_UP, 0x221: KEY_DOWN, 0x222: KEY_LEFT, 0x223: KEY_RIGHT}
@@ -132,10 +136,20 @@ class InputLocker:
             fd = os.open(self.uinput_path, os.O_WRONLY | os.O_NONBLOCK)
             try:
                 fcntl.ioctl(fd, UI_SET_EVBIT, EV_KEY)
-                for key in NAVIGATION_KEYS + VOLUME_KEYS:
+                fcntl.ioctl(fd, UI_SET_EVBIT, EV_ABS)
+                for key in VOLUME_KEYS + (BTN_SOUTH,):
                     fcntl.ioctl(fd, UI_SET_KEYBIT, key)
+                for axis in (ABS_X, ABS_Y):
+                    fcntl.ioctl(fd, UI_SET_ABSBIT, axis)
+                    abs_setup = UINPUT_ABS_SETUP.pack(axis, 0, 127, 0, 255, 0, 0, 0)
+                    fcntl.ioctl(fd, UI_ABS_SETUP, abs_setup)
                 setup = UINPUT_SETUP.pack(
-                    BUS_USB, 0x0001, 0x0001, 1, b"Arcade navigation", 0
+                    BUS_USB,
+                    0x0079,
+                    0x0006,
+                    0x0110,
+                    b"DragonRise Inc.   Generic   USB  Joystick  ",
+                    0,
                 )
                 fcntl.ioctl(fd, UI_DEV_SETUP, setup)
                 fcntl.ioctl(fd, UI_DEV_CREATE, 0)
@@ -144,6 +158,8 @@ class InputLocker:
                 raise
             self.uinput_fd = fd
             time.sleep(0.2)
+            self._emit(EV_ABS, ABS_X, 127)
+            self._emit(EV_ABS, ABS_Y, 127)
             self.log("INPUT: navigation and volume enabled, game buttons locked")
             return True
         except OSError as error:
@@ -195,27 +211,25 @@ class InputLocker:
 
     def _forward_event(self, event_type: int, code: int, value: int) -> None:
         if event_type == EV_ABS:
-            mapped = navigation_key(code, value)
-            if mapped is None:
-                return
-            key, pressed = mapped
-            if pressed:
-                self.pressed_keys.add(key)
-                self._emit(EV_KEY, key, 1)
+            if code in (ABS_X, ABS_HAT0X):
+                axis = ABS_X
+            elif code in (ABS_Y, ABS_HAT0Y):
+                axis = ABS_Y
             else:
-                keys = (KEY_LEFT, KEY_RIGHT) if code in (ABS_X, ABS_HAT0X) else (KEY_UP, KEY_DOWN)
-                for arrow in keys:
-                    self.pressed_keys.discard(arrow)
-                    self._emit(EV_KEY, arrow, 0)
+                return
+            if code in (ABS_HAT0X, ABS_HAT0Y):
+                value = 0 if value < 0 else 255 if value > 0 else 127
+            self._emit(EV_ABS, axis, value)
         elif event_type == EV_KEY:
-            mapped = navigation_button(code, value)
-            if mapped is not None:
-                key, pressed = mapped
-                if pressed:
-                    self.pressed_keys.add(key)
-                else:
-                    self.pressed_keys.discard(key)
-                self._emit(EV_KEY, key, int(pressed))
+            digital = {
+                0x220: (ABS_Y, 0),
+                0x221: (ABS_Y, 255),
+                0x222: (ABS_X, 0),
+                0x223: (ABS_X, 255),
+            }.get(code)
+            if digital is not None:
+                axis, active_value = digital
+                self._emit(EV_ABS, axis, active_value if value else 127)
             elif code in VOLUME_KEYS:
                 self._emit(EV_KEY, code, value)
 
