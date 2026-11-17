@@ -1,0 +1,11 @@
+{
+  "enabled": true,
+  "broker": "tcp://MQTT_SERVER:1883",
+  "username": "tcn-MACHINE_ID",
+  "password": "YOUR_PASSWORD",
+  "machineId": "MACHINE_ID",
+  "topicPrefix": "tcn/MACHINE_ID",
+  "gameSystems": ["nes", "dreamcast"],
+  "heartbeatSec": 30,
+  "gamesRefreshSec": 60
+}

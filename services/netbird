@@ -1,0 +1,54 @@
+#!/bin/bash
+
+ROOT="/userdata/system/netbird"
+BIN="$ROOT/bin/netbird"
+CONFIG="$ROOT/default.json"
+PIDFILE="/var/run/netbird-service.pid"
+LOG="$ROOT/service.log"
+MANAGEMENT_URL="https://net.moxitech.ru"
+
+prepare() {
+    mkdir -p "$ROOT/bin" /dev/net
+    [ -x "$BIN" ] || { echo "netbird: missing $BIN"; return 1; }
+    ln -sfn "$BIN" /usr/bin/netbird
+    modprobe tun 2>/dev/null || true
+    [ -c /dev/net/tun ] || mknod /dev/net/tun c 10 200
+    chmod 666 /dev/net/tun
+}
+
+start() {
+    prepare || return 1
+    if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+        echo "netbird is already running"
+        return 0
+    fi
+    start-stop-daemon -S -b -m -p "$PIDFILE" -x /bin/bash -- -c \
+        "exec \"$BIN\" --config \"$CONFIG\" --log-file console service run >> \"$LOG\" 2>&1"
+    sleep 2
+    "$BIN" --config "$CONFIG" --management-url "$MANAGEMENT_URL" up >> "$LOG" 2>&1 || true
+    echo "netbird started"
+}
+
+stop() {
+    "$BIN" --config "$CONFIG" down >/dev/null 2>&1 || true
+    if [ -f "$PIDFILE" ]; then
+        pid="$(cat "$PIDFILE" 2>/dev/null)"
+        [ -n "$pid" ] && kill -TERM "$pid" 2>/dev/null || true
+        rm -f "$PIDFILE"
+    fi
+    pkill -TERM -f "$BIN.*service run" 2>/dev/null || true
+    echo "netbird stopped"
+}
+
+status() {
+    "$BIN" --config "$CONFIG" status 2>&1 || true
+}
+
+case "$1" in
+    start) start ;;
+    stop) stop ;;
+    restart) stop; sleep 1; start ;;
+    status) status ;;
+    *) echo "Usage: $0 {start|stop|restart|status}"; exit 1 ;;
+esac
+exit "$?"

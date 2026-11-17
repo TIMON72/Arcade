@@ -10,6 +10,7 @@ from __future__ import annotations
 import glob
 import os
 import re
+import signal
 import shutil
 import subprocess
 import sys
@@ -211,7 +212,9 @@ def physical_address_bytes(physical_address: str) -> str:
     return f"{b0:02x}:{b1:02x}"
 
 
-def cec_cmd(command: str, *, osd_name: str = "Arcade", debug: int = 1) -> str:
+def cec_cmd(
+    command: str, *, osd_name: str = "Arcade", debug: int = 1, timeout_sec: float = 30
+) -> str:
     """Одна команда (-s). Для power on/poll; Active Source так не удерживается."""
     try:
         result = subprocess.run(
@@ -219,7 +222,7 @@ def cec_cmd(command: str, *, osd_name: str = "Arcade", debug: int = 1) -> str:
             input=f"{command}\n",
             capture_output=True,
             text=True,
-            timeout=30,
+            timeout=max(0.1, timeout_sec),
             check=False,
         )
         return ((result.stdout or "") + (result.stderr or "")).replace("\r", "")
@@ -290,17 +293,21 @@ def cec_session(
     return "".join(chunks).replace("\r", "")
 
 
-def tv_power(device: int = 0, *, osd_name: str = "Arcade", debug: int = 1) -> str:
-    out = cec_cmd(f"pow {device}", osd_name=osd_name, debug=debug)
+def tv_power(
+    device: int = 0, *, osd_name: str = "Arcade", debug: int = 1, timeout_sec: float = 30
+) -> str:
+    out = cec_cmd(f"pow {device}", osd_name=osd_name, debug=debug, timeout_sec=timeout_sec)
     match = re.search(r"power status:\s*(\S+)", out)
     return match.group(1) if match else "unknown"
 
 
-def wake_tv(device: int = 0, *, osd_name: str = "Arcade", debug: int = 1) -> None:
+def wake_tv(
+    device: int = 0, *, osd_name: str = "Arcade", debug: int = 1, timeout_sec: float = 30
+) -> None:
     # Как в первой рабочей версии: on + as на каждой попытке.
     # Иначе ТВ может включиться, но остаться на другом входе — DRM так и не станет connected.
-    cec_cmd(f"on {device}", osd_name=osd_name, debug=debug)
-    cec_cmd("as", osd_name=osd_name, debug=debug)
+    cec_cmd(f"on {device}", osd_name=osd_name, debug=debug, timeout_sec=timeout_sec)
+    cec_cmd("as", osd_name=osd_name, debug=debug, timeout_sec=timeout_sec)
 
 
 def parse_active_source(scan_out: str) -> str:
@@ -314,11 +321,7 @@ def active_source_ok(active: str, physical_address: str) -> bool:
     lowered = active.lower()
     if "unknown" in lowered or "-1" in lowered:
         return False
-    if physical_address in active:
-        return True
-    if "recorder" in lowered or "playback" in lowered or "arcade" in lowered:
-        return True
-    return bool(re.search(r"\(\d+\)", active))
+    return physical_address in active
 
 
 def hdmi_output_candidates(hdmi_output: str) -> tuple[str, ...]:
@@ -438,18 +441,38 @@ def physical_address_candidates(primary: str) -> tuple[str, ...]:
 
 
 def wait_tv_power_on(tvon: TvonConfig) -> str:
-    elapsed = 0
+    started = time.monotonic()
+    deadline = started + tvon.max_wait_sec
     status = "unknown"
-    while elapsed < tvon.max_wait_sec:
-        log(f"TVON: wake elapsed={elapsed}s")
-        wake_tv(tvon.device, osd_name=tvon.osd_name, debug=tvon.cec_debug)
-        time.sleep(2)
-        status = tv_power(tvon.device, osd_name=tvon.osd_name, debug=tvon.cec_debug)
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        log(f"TVON: wake elapsed={int(time.monotonic() - started)}s")
+        timeout = max(0.1, min(30, remaining / 3))
+        wake_tv(
+            tvon.device, osd_name=tvon.osd_name, debug=tvon.cec_debug, timeout_sec=timeout
+        )
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(2, remaining))
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        status = tv_power(
+            tvon.device,
+            osd_name=tvon.osd_name,
+            debug=tvon.cec_debug,
+            timeout_sec=max(0.1, min(30, remaining)),
+        )
         log(f"TVON: power={status}")
         if status == "on":
             return status
-        time.sleep(tvon.interval_sec)
-        elapsed += tvon.interval_sec + 2
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(tvon.interval_sec, remaining))
     return status
 
 
@@ -504,6 +527,8 @@ _source_keeper_thread: threading.Thread | None = None
 _source_keeper_proc: subprocess.Popen[str] | None = None
 _source_keeper_stop = threading.Event()
 _source_claim_ok = False
+_source_keeper_active = "unknown"
+_supervise_stop = threading.Event()
 
 
 def clear_stale_cec_clients() -> None:
@@ -541,7 +566,7 @@ def clear_stale_cec_clients() -> None:
 
 
 def stop_active_source_keeper() -> None:
-    global _source_keeper_thread, _source_keeper_proc, _source_claim_ok
+    global _source_keeper_thread, _source_keeper_proc, _source_claim_ok, _source_keeper_active
     _source_keeper_stop.set()
     proc = _source_keeper_proc
     if proc is not None and proc.poll() is None:
@@ -565,6 +590,7 @@ def stop_active_source_keeper() -> None:
     _source_keeper_thread = None
     _source_keeper_proc = None
     _source_claim_ok = False
+    _source_keeper_active = "unknown"
 
 
 def _keeper_write(proc: subprocess.Popen[str], commands: list[str]) -> bool:
@@ -584,20 +610,16 @@ def _keeper_write(proc: subprocess.Popen[str], commands: list[str]) -> bool:
 def start_active_source_keeper(tvon: TvonConfig, physical_address: str) -> None:
     """
     One long-lived cec-client: claim Active Source, then keep the process open
-    (with periodic refresh) until stop_active_source_keeper().
+    without repeated commands that can emit DRM hotplug events.
     """
     global _source_keeper_thread, _source_keeper_proc, _source_claim_ok
     stop_active_source_keeper()
     _source_keeper_stop.clear()
     pa_hex = physical_address_bytes(physical_address)
-    refresh_sec = max(8.0, float(min(20, tvon.claim_hold_sec)))
 
     def _run() -> None:
-        global _source_keeper_proc, _source_claim_ok
-        log(
-            f"TVON: active_source keeper start refresh={int(refresh_sec)}s "
-            f"pa={physical_address}"
-        )
+        global _source_keeper_proc, _source_claim_ok, _source_keeper_active
+        log(f"TVON: active_source keeper start hold-only pa={physical_address}")
         proc = subprocess.Popen(
             [_cec_client(), "-d", str(tvon.cec_debug), "-o", tvon.osd_name],
             stdin=subprocess.PIPE,
@@ -606,14 +628,13 @@ def start_active_source_keeper(tvon: TvonConfig, physical_address: str) -> None:
             text=True,
         )
         _source_keeper_proc = proc
-        chunks: list[str] = []
-
         def _drain() -> None:
             try:
                 if proc.stdout:
-                    data = proc.stdout.read()
-                    if data:
-                        chunks.append(data)
+                    for line in proc.stdout:
+                        if "currently active source:" in line.lower():
+                            _source_keeper_active = line.split(":", 1)[1].strip()
+                            log(f"TVON: keeper active_source={_source_keeper_active}")
             except OSError:
                 pass
 
@@ -633,22 +654,11 @@ def start_active_source_keeper(tvon: TvonConfig, physical_address: str) -> None:
                 return
             _source_claim_ok = True
             log("TVON: active_source keeper claimed")
-            next_refresh = time.monotonic() + refresh_sec
             while not _source_keeper_stop.is_set():
                 if proc.poll() is not None:
                     log("TVON: active_source keeper process exited early")
                     _source_claim_ok = False
                     break
-                now = time.monotonic()
-                if now >= next_refresh:
-                    if not _keeper_write(
-                        proc, ["as", f"tx 1f:82:{pa_hex}", "as"]
-                    ):
-                        log("TVON: active_source keeper refresh write failed")
-                        _source_claim_ok = False
-                        break
-                    log("TVON: active_source keeper refresh")
-                    next_refresh = time.monotonic() + refresh_sec
                 time.sleep(0.5)
         except (OSError, BrokenPipeError) as error:
             log(f"TVON: active_source keeper ERROR {error}")
@@ -701,13 +711,13 @@ def source_keeper_alive() -> bool:
 
 
 def verify_active_source(tvon: TvonConfig, physical_address: str) -> bool:
-    # Competing scan while keeper holds the bus knocks Active Source to unknown(-1).
-    if source_keeper_alive():
-        log("TVON: verify active_source keeper=alive")
-        return True
-    active = query_active_source(tvon)
-    ok = active_source_ok(active, physical_address)
+    keeper = source_keeper_alive()
+    active = _source_keeper_active if keeper else query_active_source(tvon)
+    ok = active_source_ok(active, physical_address) or (
+        keeper and "recorder 1" in active.lower()
+    )
     if ok:
+        log(f"TVON: verify active_source confirmed keeper={keeper}")
         return True
     log(
         f"TVON: active_source not ours (want pa={physical_address}, got={active})"
@@ -716,12 +726,10 @@ def verify_active_source(tvon: TvonConfig, physical_address: str) -> bool:
 
 
 def ensure_active_source(tvon: TvonConfig, physical_address: str) -> bool:
-    """
-    Claim + hold in one continuous cec-client session (no exit between claim and hold).
-    """
+    global _source_keeper_active
     if source_keeper_alive():
-        log("TVON: active_source already held by keeper")
-        return True
+        log("TVON: active_source reclaim with fresh keeper")
+        stop_active_source_keeper()
 
     pas = physical_address_candidates(physical_address)
     for attempt in range(1, tvon.active_source_retries + 1):
@@ -730,7 +738,13 @@ def ensure_active_source(tvon: TvonConfig, physical_address: str) -> bool:
             f"TVON: active_source ensure "
             f"{attempt}/{tvon.active_source_retries} pa={pa}"
         )
+        claimed, active = claim_input_session(tvon, pa)
+        if not claimed and "recorder 1" not in active.lower():
+            wake_tv(tvon.device, osd_name=tvon.osd_name, debug=tvon.cec_debug)
+            time.sleep(tvon.claim_interval_sec)
+            continue
         start_active_source_keeper(tvon, pa)
+        _source_keeper_active = active
         if tvon.active_source_recheck_sec > 0:
             time.sleep(tvon.active_source_recheck_sec)
         if verify_active_source(tvon, pa):
@@ -1384,26 +1398,23 @@ def _drm_output_has_mode(output_name: str) -> bool:
         conn_dir = os.path.dirname(status_path)
         enabled_path = os.path.join(conn_dir, "enabled")
         modes_path = os.path.join(conn_dir, "modes")
-        enabled_ok = True
-        modes_ok = True
+        has_enabled = os.path.isfile(enabled_path)
+        has_modes = os.path.isfile(modes_path)
+        enabled_ok = False
+        modes_ok = False
         try:
-            if os.path.isfile(enabled_path):
+            if has_enabled:
                 with open(enabled_path, encoding="utf-8") as handle:
                     enabled_ok = handle.read().strip().lower() == "enabled"
         except OSError:
-            enabled_ok = False
+            pass
         try:
-            if os.path.isfile(modes_path):
+            if has_modes:
                 with open(modes_path, encoding="utf-8") as handle:
                     modes_ok = bool(handle.read().strip())
         except OSError:
-            modes_ok = False
-        if enabled_ok and modes_ok:
-            return True
-        # Some kernels only expose one of the two.
-        if os.path.isfile(enabled_path) and enabled_ok:
-            return True
-        if os.path.isfile(modes_path) and modes_ok and not os.path.isfile(enabled_path):
+            pass
+        if (has_enabled and enabled_ok) or (has_modes and modes_ok):
             return True
     return False
 
@@ -1678,7 +1689,7 @@ def post_check(
                 ensure_active_source(tvon, physical_address)
 
 
-def supervise(tvon: TvonConfig) -> int:
+def _supervise_startup(tvon: TvonConfig) -> int:
     log("TVON: start")
     if not tvon.enabled:
         log("TVON: disabled in config")
@@ -1701,7 +1712,6 @@ def supervise(tvon: TvonConfig) -> int:
         f"max_wait={tvon.max_wait_sec}s hdmi_wait={tvon.hdmi_wait_sec}s "
         f"settle={tvon.settle_sec}s hold={tvon.claim_hold_sec}s "
         f"active_source_retries={tvon.active_source_retries} "
-        f"keep={tvon.active_source_keep_sec}s "
         f"refresh_audio={tvon.refresh_audio} "
         f"audio_hard_restart={tvon.audio_hard_restart} "
         f"audio_soft_wait={tvon.audio_soft_wait_sec}s "
@@ -1714,7 +1724,8 @@ def supervise(tvon: TvonConfig) -> int:
     )
 
     clear_stale_cec_clients()
-    time.sleep(tvon.initial_delay_sec)
+    if _supervise_stop.wait(tvon.initial_delay_sec):
+        return 0
 
     candidates = hdmi_output_candidates(tvon.hdmi_output)
     statuses = hdmi_drm_statuses(candidates)
@@ -1744,21 +1755,49 @@ def supervise(tvon: TvonConfig) -> int:
         if recover_es_if_empty_outputs(tvon, active_hdmi):
             pic_ok = verify_picture(active_hdmi)
             src_ok = verify_active_source(tvon, physical_address)
+    audio_ok = (not tvon.refresh_audio) or verify_audio_hdmi(active_hdmi)
     log(
         f"TVON: TV on, display={active_hdmi}, "
-        f"picture={pic_ok}, active_source={src_ok}, audio={audio_ok}, done"
+        f"picture={pic_ok}, active_source={src_ok}, audio={audio_ok}, startup done"
     )
-    # Process exit kills daemon threads — hold so TV stays on our input, then release.
-    if pic_ok and live_hdmi:
-        if not source_keeper_alive():
-            start_active_source_keeper(tvon, physical_address)
-        log(
-            f"TVON: holding active_source "
-            f"{tvon.active_source_keep_sec}s before exit"
+    return 0 if (pic_ok and src_ok and audio_ok) else 1
+
+
+def supervise(tvon: TvonConfig) -> int:
+    def request_stop(_signum, _frame):
+        _supervise_stop.set()
+
+    _supervise_stop.clear()
+    previous_term = signal.signal(signal.SIGTERM, request_stop)
+    previous_int = signal.signal(signal.SIGINT, request_stop)
+    try:
+        if not tvon.enabled:
+            return _supervise_startup(tvon)
+        result = _supervise_startup(tvon)
+        if result != 0:
+            return result
+        candidates = hdmi_output_candidates(tvon.hdmi_output)
+        physical_address = resolve_physical_address(
+            tvon, detect_connected_hdmi(candidates)
         )
-        time.sleep(tvon.active_source_keep_sec)
+        log("TVON: supervisor active; CEC keeper stays open")
+        next_check = time.monotonic()
+        while not _supervise_stop.is_set():
+            now = time.monotonic()
+            if now >= next_check:
+                if not source_keeper_alive() or not verify_active_source(
+                    tvon, physical_address
+                ):
+                    log("TVON: supervisor recover active_source")
+                    ensure_active_source(tvon, physical_address)
+                next_check = now + 30
+            _supervise_stop.wait(1)
+        log("TVON: stop requested")
+        return 0
+    finally:
         stop_active_source_keeper()
-    return 0 if (pic_ok and src_ok) else 1
+        signal.signal(signal.SIGTERM, previous_term)
+        signal.signal(signal.SIGINT, previous_int)
 
 
 def run() -> int:

@@ -14,6 +14,9 @@ time_reset = 5
 # Unix datagram: команды от сервиса server (modules/timer.py)
 cmd_socket = "/var/run/arcade-timer.sock"
 
+# USB Arduino с прошивкой Serial 115200
+serial_port = "/dev/ttyUSB0"
+
 [gpio]
 # Пины RF (BCM): в режиме Raspberry — входы пульта; в Arduino — выходы «имитация радио»
 rf_increase = 5      # "+"

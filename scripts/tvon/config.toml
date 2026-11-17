@@ -27,8 +27,8 @@ claim_hold_sec = 15
 # После закрытия cec-client: повторный scan Active Source + re-claim если unknown/-1
 active_source_retries = 3
 active_source_recheck_sec = 3
-# Держать CEC-сессию после claim (иначе ТВ сбрасывает Active Source в unknown/-1).
-# Секунды удержания ПОСЛЕ успешного supervise (во время этапов keeper живёт до stop).
+# Устаревший параметр: keeper теперь работает постоянно под supervise с проверкой каждые 30 секунд.
+# Значение сохранено для совместимости конфигов и ни на что не влияет.
 active_source_keep_sec = 120
 # После CEC — batocera-resolution setOutput (чинит чёрный экран после boot без ТВ)
 refresh_display = true

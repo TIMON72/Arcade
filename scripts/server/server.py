@@ -27,6 +27,7 @@ if _MAIN_DIR not in sys.path:
     sys.path.insert(0, _MAIN_DIR)
 
 from main import log
+from modules import arcade_mqtt
 from modules import timer as timer_bridge
 
 routes = web.RouteTableDef()
@@ -101,12 +102,16 @@ async def _serve(host: str, port: int):
 def run(host="0.0.0.0", port: Optional[int] = None):
     if port is None:
         port = server_config.port
+    mqtt_agent = arcade_mqtt.start()
     try:
         asyncio.run(_serve(host, port))
     except OSError as e:
         log(f"WEB: bind failed port={port}: {e}")
     except Exception as e:
         log(f"WEB: stopped: {e}")
+    finally:
+        if mqtt_agent is not None:
+            mqtt_agent.stop()
 
 
 if __name__ == "__main__":

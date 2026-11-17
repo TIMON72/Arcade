@@ -34,6 +34,7 @@ _DEPLOYED_SCRIPTS_DIR = os.path.join(_BATOCERA_SYSTEM_DIR, "scripts")
 _DEPLOY_MARKER = os.path.join(_BATOCERA_SYSTEM_DIR, ".arcade-deployed")
 _ARCADE_CHECKOUT = os.path.join(_BATOCERA_SYSTEM_DIR, "Arcade")
 _ARCADE_SERVICES = ("main", "timer", "server", "tvon")
+_ARCADE_ALL_SERVICES = _ARCADE_SERVICES + ("netbird",)
 _GIT_INSTALL_DIR = os.path.join(_BATOCERA_SYSTEM_DIR, "git")
 _GIT_VENDOR_REL = os.path.join("vendor", "git")
 _VENV_VENDOR_REL = os.path.join("vendor", "venv")
@@ -59,6 +60,7 @@ _GIT_DOWNLOAD_BASE = (
 
 _CONFIG_FILENAME = "config.toml"
 _LUMA_PACKAGE = "luma.led_matrix==1.9.0"
+_PAHO_PACKAGE = "paho-mqtt==2.1.0"
 _REQUIREMENTS_FILE_NAME = "requirements.txt"
 
 # Общий лог: на Batocera — /userdata/system/scripts/logs.log;
@@ -481,7 +483,7 @@ def _atomic_replace_file(src: str, dst: str) -> None:
     tmp = dst + ".arcade-new"
     _remove_path(tmp)
     shutil.copy2(src, tmp)
-    if os.path.basename(dst) in _ARCADE_SERVICES or src.endswith(".sh"):
+    if os.path.basename(dst) in _ARCADE_ALL_SERVICES or src.endswith(".sh"):
         _fix_shell_line_endings(tmp)
         try:
             os.chmod(tmp, 0o755)
@@ -495,7 +497,7 @@ def _atomic_replace_file(src: str, dst: str) -> None:
 def _ensure_batocera_services_enabled() -> None:
     """system.services=main timer server tvon + batocera-services enable."""
     conf_path = os.path.join(_BATOCERA_SYSTEM_DIR, "batocera.conf")
-    wanted = " ".join(_ARCADE_SERVICES)
+    wanted = " ".join(_ARCADE_ALL_SERVICES)
     if os.path.isfile(conf_path):
         try:
             with open(conf_path, encoding="utf-8") as conf_file:
@@ -515,7 +517,7 @@ def _ensure_batocera_services_enabled() -> None:
         except OSError as error:
             print(f"⚠ cannot update batocera.conf services: {error}")
 
-    for name in _ARCADE_SERVICES:
+    for name in _ARCADE_ALL_SERVICES:
         subprocess.run(
             ["batocera-services", "enable", name],
             capture_output=True,
@@ -597,7 +599,7 @@ def deploy_to_batocera(force: bool = False, source_root: str | None = None) -> b
                 )
         elif folder == "services":
             os.makedirs(dst, mode=0o755, exist_ok=True)
-            for name in _ARCADE_SERVICES:
+            for name in _ARCADE_ALL_SERVICES:
                 src_file = os.path.join(src, name)
                 if os.path.isfile(src_file):
                     _atomic_replace_file(src_file, os.path.join(dst, name))
@@ -653,7 +655,7 @@ def deploy_to_batocera(force: bool = False, source_root: str | None = None) -> b
 
     print("✓ Batocera deployment complete (fsync'd)")
     print(f"  marker: {_DEPLOY_MARKER}")
-    print(f"  Services: {' '.join(_ARCADE_SERVICES)}")
+    print(f"  Services: {' '.join(_ARCADE_ALL_SERVICES)}")
     print("=" * 60)
     return True
 
@@ -1065,7 +1067,7 @@ def _deps_installed(python_path: str | None = None) -> bool:
     except OSError:
         return False
     result = subprocess.run(
-        [python, "-c", "import luma.led_matrix"],
+        [python, "-c", "import luma.led_matrix, paho.mqtt.client"],
         capture_output=True,
         check=False,
     )
@@ -1111,18 +1113,19 @@ def _install_dependencies() -> bool:
         if os.path.isdir(_WHEELS_DIR)
         else []
     )
+    packages = [_LUMA_PACKAGE, _PAHO_PACKAGE]
     if wheels:
-        print(f"Installing {_LUMA_PACKAGE} from {len(wheels)} local wheels (offline)...")
+        print(f"Installing Arcade dependencies from {len(wheels)} local wheels (offline)...")
         cmd = [
             *pip_cmd,
             "install",
             "--no-index",
             f"--find-links={_WHEELS_DIR}",
-            _LUMA_PACKAGE,
+            *packages,
         ]
     else:
-        print(f"⚠ wheels/ not found — trying pip over the network ({_LUMA_PACKAGE})...")
-        cmd = [*pip_cmd, "install", _LUMA_PACKAGE]
+        print("⚠ wheels/ not found — trying pip over the network...")
+        cmd = [*pip_cmd, "install", *packages]
 
     result = subprocess.run(cmd)
     if result.returncode == 0:

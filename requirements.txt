@@ -1,1 +1,2 @@
 luma.led_matrix==1.9.0
+paho-mqtt==2.1.0

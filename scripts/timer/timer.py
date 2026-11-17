@@ -29,6 +29,7 @@ class TimerConfig:
     time_reset: int = 5
     timer_mode: str = "Raspberry"
     cmd_socket: str = "/var/run/arcade-timer.sock"
+    serial_port: str = "/dev/ttyUSB0"
 
 
 @dataclass(frozen=True)
@@ -185,6 +186,7 @@ def load_timer_config(data: dict | None = None) -> TimerConfig:
         time_reset=_read_positive_int(section, "time_reset", defaults.time_reset),
         timer_mode=_read_timer_mode(section, defaults.timer_mode),
         cmd_socket=_read_string(section, "cmd_socket", defaults.cmd_socket),
+        serial_port=_read_string(section, "serial_port", defaults.serial_port),
     )
 
 
@@ -534,6 +536,8 @@ b_increase: Button | None = None
 b_playpause: Button | None = None
 b_stop: Button | None = None
 terminal_cashless: TerminalCashless | None = None
+input_locker = None
+serial_link = None
 
 # Флаги для отслеживания каких контактов удалось выделить
 gpio_pins_available = {name: False for name in {**OUTPUT_PINS, **INPUT_PINS}}
@@ -793,6 +797,11 @@ def set_machine_state(name=None, starting=False, playing=False, waiting=False):
         state_stopping = False
     if name:
         log_state(name)
+    if input_locker is not None:
+        if playing:
+            input_locker.unlock()
+        else:
+            input_locker.lock()
 
 
 def sync_state_flags():
@@ -936,22 +945,9 @@ def relay_click(relay: int):
 
 
 def rf_click(rf_pin: int):
-    """Имитация нажатия радиокнопки (выход HIGH ~1 с) — режим Arduino."""
-    if h is None:
-        log(f"RF: skip click pin={rf_pin} (GPIO not open)")
-        return
-    pin_name = PIN_TO_OUTPUT_NAME.get(rf_pin)
-    if pin_name and not gpio_pins_available.get(pin_name):
-        log(f"RF: skip click {pin_name}({rf_pin}) (not available)")
-        return
-    short = {RF_INCREASE: "INCREASE", RF_PLAYPAUSE: "PLAYPAUSE", RF_STOP: "STOP"}.get(
-        rf_pin, RF_PIN_NAMES.get(rf_pin, str(rf_pin))
-    )
-    finish_timer_line()
-    log(f"RF: {short}({rf_pin}) clicked")
-    lgpio.gpio_write(h, rf_pin, 1)
-    time.sleep(1)
-    lgpio.gpio_write(h, rf_pin, 0)
+    command = {RF_INCREASE: "ADD 1", RF_PLAYPAUSE: "PLAYPAUSE", RF_STOP: "STOP"}.get(rf_pin)
+    if serial_link is None or command is None or not serial_link.send(command):
+        log(f"SERIAL: command for pin {rf_pin} was not sent")
 
 
 def arduino_busy():
@@ -1010,7 +1006,7 @@ def arduino_pay(steps):
         state_waiting = False
         state_waiter = False
         state_playing = True
-        log_state("PLAYING")
+        set_machine_state("PLAYING", playing=True)
         return
     if state_waiting:
         log(f"ACT: pay +{steps * 5} (pause → + then PLAY)")
@@ -1019,7 +1015,7 @@ def arduino_pay(steps):
         rf_playpause_sent_at = time.monotonic()
         state_waiting = False
         state_playing = True
-        log_state("PLAYING")
+        set_machine_state("PLAYING", playing=True)
         return
     if state_playing:
         log(f"ACT: pay +{steps * 5} (playing)")
@@ -1029,6 +1025,7 @@ def arduino_pay(steps):
     rf_burst(RF_INCREASE, steps)
     rf_click(RF_PLAYPAUSE)
     rf_playpause_sent_at = time.monotonic()
+    set_machine_state("PLAYING", playing=True)
 
 
 def flush_arduino():
@@ -1073,10 +1070,8 @@ def do_playpause(source="api"):
             return
         # Play в PLAYING → пауза (WAITING); waiter → Play×2 (снятие waited + START)
         if state_playing and not state_waiting:
-            state_playing = False
-            state_waiting = True
             state_waiter = False
-            log_state("WAITING")
+            set_machine_state("WAITING", waiting=True)
             rf_click(RF_PLAYPAUSE)
             rf_playpause_sent_at = time.monotonic()
         elif state_waiting and state_waiter:
@@ -1087,16 +1082,17 @@ def do_playpause(source="api"):
             state_waiting = False
             state_waiter = False
             state_playing = True
-            log_state("PLAYING")
+            set_machine_state("PLAYING", playing=True)
         elif state_waiting:
             state_waiting = False
             state_playing = True
-            log_state("PLAYING")
+            set_machine_state("PLAYING", playing=True)
             rf_click(RF_PLAYPAUSE)
             rf_playpause_sent_at = time.monotonic()
         else:
             rf_click(RF_PLAYPAUSE)
             rf_playpause_sent_at = time.monotonic()
+            set_machine_state("PLAYING", playing=True)
     else:
         handle_playpause(source)
 
@@ -1169,7 +1165,13 @@ _gpio_unavailable_warned = False
 
 
 def teardown_gpio():
-    global h, b_increase, b_playpause, b_stop, terminal_cashless
+    global h, b_increase, b_playpause, b_stop, terminal_cashless, input_locker, serial_link
+    if input_locker is not None:
+        input_locker.close()
+        input_locker = None
+    if serial_link is not None:
+        serial_link.close()
+        serial_link = None
     if h is None:
         return
     try:
@@ -1202,10 +1204,20 @@ def teardown_gpio():
 
 
 def setup():
-    global h, b_increase, b_playpause, b_stop, gpio_pins_available, terminal_cashless
+    global h, b_increase, b_playpause, b_stop, gpio_pins_available, terminal_cashless, input_locker, serial_link
     if h is not None and any(gpio_pins_available.values()):
         return
     log("Timer started")
+    from modules import input_lock
+    input_locker = input_lock.InputLocker(log)
+    input_locker.lock()
+    if is_arduino_mode():
+        from modules.serial_link import SerialLink
+        serial_link = SerialLink(timer_config.serial_port, on_serial_state, log)
+        if serial_link.start():
+            time.sleep(2)
+            serial_link.poll()
+            do_stop("setup")
     log(
         f"Config: timer_mode={TIMER_MODE}, time_step={time_step} min, "
         f"time_wait={time_wait} sec, time_reset={time_reset} min"
@@ -1217,7 +1229,7 @@ def setup():
         f"relay_active_low={isRelayLow}"
     )
     if is_arduino_mode():
-        log("Mode Arduino: RF pins = OUTPUT (radio sim), R_* pins = INPUT (state from Arduino)")
+        log(f"Mode Arduino: USB Serial {timer_config.serial_port}, relay state inputs disabled")
     else:
         log("Mode Raspberry: RF pins = INPUT (remote), R_* pins = OUTPUT (relays)")
     log(
@@ -1259,13 +1271,11 @@ def setup():
             b_stop = None
 
         for pin_name, pin in OUTPUT_PINS.items():
+            if is_arduino_mode():
+                break
             try:
-                if is_arduino_mode():
-                    # Радиоимитация: покой LOW
-                    lgpio.gpio_claim_output(h, pin, 0)
-                else:
-                    lgpio.gpio_claim_output(h, pin, lgpio.SET_PULL_UP)
-                    relay_deactivate(pin)
+                lgpio.gpio_claim_output(h, pin, lgpio.SET_PULL_UP)
+                relay_deactivate(pin)
                 gpio_pins_available[pin_name] = True
                 print(f"GPIO {pin_name}({pin}) -> OK (output)")
             except Exception as e:
@@ -1273,11 +1283,10 @@ def setup():
                 print(f"GPIO {pin_name}({pin}) -> BUSY ({e})")
 
         for pin_name, pin in INPUT_PINS.items():
+            if is_arduino_mode():
+                break
             try:
-                if is_arduino_mode():
-                    lgpio.gpio_claim_input(h, pin)
-                else:
-                    lgpio.gpio_claim_input(h, pin, lgpio.SET_PULL_DOWN)
+                lgpio.gpio_claim_input(h, pin, lgpio.SET_PULL_DOWN)
                 gpio_pins_available[pin_name] = True
                 print(f"GPIO {pin_name}({pin}) -> OK (input)")
             except Exception as e:
@@ -1334,6 +1343,8 @@ def loop(queue_main=None):
                 flush_arduino()
             if terminal_cashless is not None:
                 terminal_cashless.process()
+            if input_locker is not None:
+                input_locker.poll()
             if is_raspberry_mode():
                 if (
                     gpio_inputs_ready()
@@ -1443,52 +1454,6 @@ def action(signal):
                 log_state("ERROR")
 
 
-def update_state_from_relays():
-    """Режим Arduino: состояния по входам R_*."""
-    global state_waiter
-    if h is None:
-        return
-    if not all(gpio_pins_available.get(name, False) for name in ('R_BUTTONS', 'R_PLAYPAUSE', 'R_STOP')):
-        return
-    try:
-        buttons_state = lgpio.gpio_read(h, R_BUTTONS)
-        playpause_state = lgpio.gpio_read(h, R_PLAYPAUSE)
-        stop_state = lgpio.gpio_read(h, R_STOP)
-    except Exception as e:
-        log(f"WARNING: Error reading relay state GPIO: {e}")
-        return
-
-    if isRelayLow:
-        buttons_state = not buttons_state
-        playpause_state = not playpause_state
-        stop_state = not stop_state
-
-    # Все «активны» → реле не подключено
-    if buttons_state and playpause_state and stop_state:
-        if state_starting or state_playing or state_waiting:
-            set_machine_state("ERROR")
-        else:
-            set_machine_state()
-    elif not state_stopping and not state_starting and stop_state:
-        # Ожидание истекло без оплаты → STOPPING + глухое окно «КОНЕЦ»
-        begin_stopping()
-    elif not buttons_state and playpause_state and not stop_state:
-        # Игра: в т.ч. продолжение с пульта Arduino (реле → PLAYING).
-        # Пульт НЕ идёт на RF_* Pi (там OUTPUT); видим только R_*.
-        if state_waiting or not state_playing:
-            set_machine_state("PLAYING", playing=True)
-    elif state_waiting:
-        pass  # ждём PLAYING / STOP
-    elif state_playing and buttons_state and playpause_state:
-        # PLAYING → WAITING: наша пауза или окно waited после конца времени на Arduino
-        our_pause = (time.monotonic() - rf_playpause_sent_at) < RF_PLAY_GRACE_S
-        set_machine_state("WAITING", waiting=True)
-        state_waiter = not our_pause
-    elif buttons_state and playpause_state:
-        set_machine_state("WAITING", waiting=True)
-        state_waiter = True
-
-
 def update_state_radio_watchdog():
     """Режим Raspberry: предупреждение, если все RF-входы странно HIGH."""
     global relay_disconnected_warned
@@ -1505,9 +1470,29 @@ def update_state_radio_watchdog():
         log(f"WARNING: Error reading GPIO: {e}")
 
 
+def on_serial_state(message):
+    global state_waiter
+    state = message["state"]
+    if state == "HELLO":
+        log("SERIAL: Arduino ready")
+    elif state == "READY":
+        set_machine_state("READY", starting=True)
+    elif state == "PLAYING":
+        set_machine_state("PLAYING", playing=True)
+    elif state == "PAUSED":
+        set_machine_state("WAITING", waiting=True)
+        state_waiter = False
+    elif state == "WAITING":
+        set_machine_state("WAITING", waiting=True)
+        state_waiter = True
+    elif state == "STOPPING":
+        set_machine_state("STOPPING", starting=True)
+
+
 def updateState():
     if is_arduino_mode():
-        update_state_from_relays()
+        if serial_link is not None:
+            serial_link.poll()
     else:
         update_state_radio_watchdog()
 

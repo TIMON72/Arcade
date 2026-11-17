@@ -7,6 +7,9 @@ __pycache__
 # Local cabinet IPs / SSH password for deploy.ps1
 deploy/machines.json
 
+# Реальный MQTT-конфиг автомата с паролем; в git только mqtt.example.json
+scripts/server/mqtt.json
+
 # Batocera runtime / local noise (не коммитить)
 configs/**/es_log*.txt
 configs/emulationstation/tmp/

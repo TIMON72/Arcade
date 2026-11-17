@@ -58,6 +58,7 @@ stop() {
     pkill -TERM -f "$SCRIPT" 2>/dev/null
     sleep 0.2
     pkill -KILL -f "$SCRIPT" 2>/dev/null
+    killall -q cec-client 2>/dev/null || true
     echo "OK"
 }
 
@@ -96,4 +97,4 @@ case "$1" in
         exit 1
         ;;
 esac
-exit 0
+exit "$?"
