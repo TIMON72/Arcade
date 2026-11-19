@@ -17,6 +17,9 @@ cmd_socket = "/var/run/arcade-timer.sock"
 # USB Arduino с прошивкой Serial 115200
 serial_port = "/dev/ttyUSB0"
 
+# false: контроллеры всегда работают напрямую, включая навигацию и запуск без оплаты
+input_lock = false
+
 [gpio]
 # Пины RF (BCM): в режиме Raspberry — входы пульта; в Arduino — выходы «имитация радио»
 rf_increase = 5      # "+"

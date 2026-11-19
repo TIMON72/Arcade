@@ -1,5 +1,6 @@
 import os
 import queue
+import subprocess
 import lgpio
 import sys
 import time
@@ -30,6 +31,7 @@ class TimerConfig:
     timer_mode: str = "Raspberry"
     cmd_socket: str = "/var/run/arcade-timer.sock"
     serial_port: str = "/dev/ttyUSB0"
+    input_lock: bool = False
 
 
 @dataclass(frozen=True)
@@ -187,6 +189,7 @@ def load_timer_config(data: dict | None = None) -> TimerConfig:
         timer_mode=_read_timer_mode(section, defaults.timer_mode),
         cmd_socket=_read_string(section, "cmd_socket", defaults.cmd_socket),
         serial_port=_read_string(section, "serial_port", defaults.serial_port),
+        input_lock=_read_bool(section, "input_lock", defaults.input_lock),
     )
 
 
@@ -797,6 +800,11 @@ def set_machine_state(name=None, starting=False, playing=False, waiting=False):
         state_stopping = False
     if name:
         log_state(name)
+    try:
+        with open("/var/run/arcade-timer-state", "w", encoding="ascii") as state_file:
+            state_file.write("PLAYING" if playing else "BLOCKED")
+    except OSError:
+        pass
     if input_locker is not None:
         if playing:
             input_locker.unlock()
@@ -1208,9 +1216,13 @@ def setup():
     if h is not None and any(gpio_pins_available.values()):
         return
     log("Timer started")
-    from modules import input_lock
-    input_locker = input_lock.InputLocker(log)
-    input_locker.lock()
+    if timer_config.input_lock:
+        from modules import input_lock
+        input_locker = input_lock.InputLocker(log)
+        input_locker.lock()
+    else:
+        input_locker = None
+        log("INPUT: direct controller navigation; unpaid game launches blocked by gameStart hook")
     if is_arduino_mode():
         from modules.serial_link import SerialLink
         serial_link = SerialLink(timer_config.serial_port, on_serial_state, log)
@@ -1499,7 +1511,25 @@ def updateState():
 
 # Главная функция
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] in ("gameStart", "gameStop"):
+    if len(sys.argv) > 1 and sys.argv[1] == "gameStart":
+        try:
+            with open("/var/run/arcade-timer-state", encoding="ascii") as state_file:
+                paid_state = state_file.read().strip()
+        except OSError:
+            paid_state = "BLOCKED"
+        if paid_state != "PLAYING":
+            log("GAME GUARD: unpaid launch blocked")
+            try:
+                subprocess.run(
+                    ["batocera-es-swissknife", "--emukill", "1"],
+                    capture_output=True,
+                    timeout=15,
+                    check=False,
+                )
+            except (OSError, subprocess.TimeoutExpired) as error:
+                log(f"GAME GUARD: emulator stop failed: {error}")
+        raise SystemExit(0)
+    if len(sys.argv) > 1 and sys.argv[1] == "gameStop":
         raise SystemExit(0)
     try:
         loop()
